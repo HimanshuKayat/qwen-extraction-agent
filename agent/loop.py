@@ -1,25 +1,31 @@
-"""Single-agent control loop.
+"""
+The autonomous agent control loop.
 
 SOURCE CONFIG
     ↓
-Qwen
+Qwen / model client
     ↓
 JSON action
     ↓
-controlled tool execution
+parse_action
     ↓
-tool result
+controlled ToolRegistry
     ↓
-Qwen
+tool execution
     ↓
-next action
+observation
+    ↓
+model again
     ↓
 ...
     ↓
 finish
 
-The model is the only decision maker.
-All execution is performed by deterministic tools.
+This is a SINGLE agent.
+
+The model is the decision maker.
+Tools are deterministic execution components.
+The model never directly executes Python, shell commands, or arbitrary code.
 """
 
 from __future__ import annotations
@@ -30,20 +36,13 @@ from agent.model import ModelClient
 from agent.parser import AgentResponseError, parse_action
 from agent.prompts import build_tool_selection_messages
 from agent.state import AgentState
-
 from core.exceptions import (
     InvalidArgumentsError,
     ToolDisabledError,
     ToolNotFoundError,
 )
-
 from core.logging_utils import get_logger, log_tool_call
-
-from tools.registry import (
-    FINISH_ACTION,
-    ToolRegistry,
-    execute_action,
-)
+from tools.registry import FINISH_ACTION, ToolRegistry, execute_action
 
 
 logger = get_logger("agent.loop")
@@ -58,15 +57,37 @@ def run_agent(
     """
     Run the autonomous extraction agent for one source.
 
-    The loop repeatedly:
+    Each step follows:
 
-    1. Builds the current agent context.
-    2. Asks Qwen for exactly one action.
-    3. Parses the model response.
-    4. Executes the controlled tool.
-    5. Records the result.
-    6. Gives the result back to Qwen.
-    7. Continues until finish/failure/max_steps.
+        1. Build the current model prompt.
+        2. Ask the model for exactly one JSON action.
+        3. Parse and validate the action.
+        4. Execute it through the controlled registry.
+        5. Store the result as an observation.
+        6. Give the updated state back to the model.
+        7. Continue until finish, failure, or max_steps.
+
+    Args:
+        source_config:
+            Source configuration dictionary.
+
+        registry:
+            Controlled ToolRegistry containing executable tools.
+
+        model_client:
+            Model client implementing:
+
+                generate(
+                    system_prompt,
+                    user_prompt,
+                    mode="tool_selection",
+                )
+
+        max_steps:
+            Maximum number of model/tool turns.
+
+    Returns:
+        Final AgentState.
     """
 
     state = AgentState(
@@ -79,13 +100,13 @@ def run_agent(
         "unknown_source",
     )
 
+    tool_descriptions = registry.to_prompt_list()
+
     while state.is_active():
 
-        # -----------------------------------------------------
-        # BUILD CURRENT MODEL CONTEXT
-        # -----------------------------------------------------
-
-        tool_descriptions = registry.to_prompt_list()
+        # -----------------------------------------------------------
+        # 1. Build current prompt
+        # -----------------------------------------------------------
 
         messages = build_tool_selection_messages(
             source_config=state.source_config,
@@ -97,19 +118,21 @@ def run_agent(
             observations=state.observations,
         )
 
-        # -----------------------------------------------------
-        # ASK MODEL
-        # -----------------------------------------------------
+        system_prompt = messages[0]["content"]
+        user_prompt = messages[1]["content"]
+
+        # -----------------------------------------------------------
+        # 2. Ask model for next action
+        # -----------------------------------------------------------
 
         try:
-
             raw_output = model_client.generate(
-                messages,
+                system_prompt,
+                user_prompt,
                 mode="tool_selection",
             )
 
-        except Exception as exc:
-
+        except Exception as exc:  # noqa: BLE001
             state.fail(
                 f"Model generation error: {exc}"
             )
@@ -121,23 +144,25 @@ def run_agent(
 
             break
 
-        # -----------------------------------------------------
-        # PARSE MODEL ACTION
-        # -----------------------------------------------------
+        # -----------------------------------------------------------
+        # 3. Parse model action
+        # -----------------------------------------------------------
 
         try:
-
             action_payload = parse_action(
                 raw_output
             )
 
         except AgentResponseError as exc:
-
             observation = (
                 f"PARSE_ERROR: {exc}"
             )
 
             state.add_observation(
+                observation
+            )
+
+            state.errors.append(
                 observation
             )
 
@@ -151,20 +176,24 @@ def run_agent(
 
             continue
 
-        # -----------------------------------------------------
-        # EXTRACT ACTION
-        # -----------------------------------------------------
+        # -----------------------------------------------------------
+        # 4. Extract action
+        # -----------------------------------------------------------
 
         action = action_payload["action"]
-
         arguments = action_payload["arguments"]
 
-        # -----------------------------------------------------
-        # EXECUTE CONTROLLED TOOL
-        # -----------------------------------------------------
+        logger.info(
+            "Model selected action on step %s: %s",
+            state.current_step,
+            action,
+        )
+
+        # -----------------------------------------------------------
+        # 5. Execute through controlled registry
+        # -----------------------------------------------------------
 
         try:
-
             result = execute_action(
                 registry,
                 action,
@@ -200,20 +229,20 @@ def run_agent(
 
             continue
 
-        # -----------------------------------------------------
-        # RECORD TOOL EXECUTION
-        # -----------------------------------------------------
+        # -----------------------------------------------------------
+        # 6. Record tool execution
+        # -----------------------------------------------------------
 
-        duration = 0.0
-
-        if isinstance(result, dict):
-
-            duration = float(
+        duration = (
+            float(
                 result.get(
                     "duration_seconds",
                     0.0,
                 )
             )
+            if isinstance(result, dict)
+            else 0.0
+        )
 
         state.record_tool_call(
             action=action,
@@ -222,18 +251,11 @@ def run_agent(
             duration_seconds=duration,
         )
 
-        error_message = None
-
-        if isinstance(result, dict):
-
-            if not result.get(
-                "success",
-                True,
-            ):
-
-                error_message = result.get(
-                    "message"
-                )
+        error_message = (
+            None
+            if result.get("success", True)
+            else result.get("message")
+        )
 
         log_tool_call(
             source_id=source_id,
@@ -245,42 +267,34 @@ def run_agent(
             error=error_message,
         )
 
-        # -----------------------------------------------------
-        # ADD RESULT TO MODEL OBSERVATIONS
-        # -----------------------------------------------------
+        # -----------------------------------------------------------
+        # 7. Add result to model's next observation
+        # -----------------------------------------------------------
 
         state.add_observation(
-            {
-                "step": state.current_step,
-                "action": action,
-                "result": result,
-            }
+            f"step={state.current_step} "
+            f"action={action} "
+            f"result={result}"
         )
 
-        # -----------------------------------------------------
-        # FINISH
-        # -----------------------------------------------------
+        # -----------------------------------------------------------
+        # 8. Finish condition
+        # -----------------------------------------------------------
 
         if action == FINISH_ACTION:
 
-            reason = (
-                result.get(
+            state.finish(
+                reason=result.get(
                     "reason",
                     "Model requested finish.",
                 )
-                if isinstance(result, dict)
-                else "Model requested finish."
-            )
-
-            state.finish(
-                reason=reason
             )
 
             break
 
-        # -----------------------------------------------------
-        # NEXT AGENT STEP
-        # -----------------------------------------------------
+        # -----------------------------------------------------------
+        # 9. Continue to next model turn
+        # -----------------------------------------------------------
 
         state.advance_step()
 
