@@ -1,0 +1,8 @@
+# Example source configuration: Phase 1 proving test.
+# source_type 1a = direct-download dataset.
+source_id: test_direct_download
+source_type: 1a
+title: Test Direct Download
+data_link: https://httpbin.org/bytes/100
+raw_dir: raw/test_direct_download
+target_schema: {}

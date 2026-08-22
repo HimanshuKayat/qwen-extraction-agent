@@ -1,0 +1,43 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Model caches / weights
+model_cache/
+*.bin
+*.safetensors
+*.gguf
+huggingface_cache/
+
+# Downloaded / generated data - never commit raw or processed artifacts
+storage/raw/**
+storage/processed/**
+storage/logs/**
+!storage/raw/.gitkeep
+!storage/processed/.gitkeep
+!storage/logs/.gitkeep
+
+# Logs / temp
+*.log
+tmp/
+*.tmp
+
+# OS
+.DS_Store
+Thumbs.db

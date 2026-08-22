@@ -1,0 +1,20 @@
+# --- Model (Qwen3-8B, 4-bit) ---
+torch>=2.11.0
+transformers>=4.51.0
+accelerate>=0.34.0
+bitsandbytes>=0.43.0
+
+# --- Data / file tools (Phase 1) ---
+pandas>=2.2.3
+openpyxl>=3.1.0
+pdfplumber>=0.11.10
+
+# --- HTTP tool (Phase 1) ---
+requests>=2.31.0
+
+# --- Config / validation ---
+pyyaml>=6.0
+jsonschema>=4.21.0
+
+# --- Testing ---
+pytest>=8.0.0
