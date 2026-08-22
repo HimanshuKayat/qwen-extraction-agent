@@ -175,3 +175,26 @@ def execute_action(
 
     # Tools are expected to return dicts; wrap anything else defensively.
     return {"success": True, "result": result, "duration_seconds": round(duration, 4)}
+ def build_registry() -> ToolRegistry:
+    """
+    Build the currently enabled Phase-1 tool registry.
+
+    This is the single entry point used by the agent
+    to determine which deterministic capabilities are
+    currently available.
+
+    Future tools such as Playwright, email, SPARQL,
+    and API tools will be added here only when their
+    implementations are ready.
+    """
+
+    from tools.definitions import (
+        get_phase1_tool_specs,
+    )
+
+    registry = ToolRegistry()
+
+    for spec in get_phase1_tool_specs():
+        registry.register(spec)
+
+    return registry
