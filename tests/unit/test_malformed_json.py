@@ -56,13 +56,11 @@ def test_parse_arguments_wrong_type_raises():
         parse_action(raw)
 
 
-def test_parse_defaults_missing_arguments_to_empty_dict():
+def test_parse_missing_arguments_raises():
     raw = '{"action": "finish"}'
 
-    parsed = parse_action(raw)
-
-    assert parsed["action"] == "finish"
-    assert parsed["arguments"] == {}
+    with pytest.raises(AgentResponseError):
+        parse_action(raw)
 
 
 def test_parse_markdown_fence_is_rejected():
