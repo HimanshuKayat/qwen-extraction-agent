@@ -1,61 +1,35 @@
-"""
-Definitions for the controlled tool registry.
+"""Build the controlled ToolRegistry used by the agent.
 
-This module is responsible for constructing the set of tools that the
-agent is currently allowed to use.
+Phase 1 tools are implemented and enabled.
 
-Architecture:
-
-    agent
-      |
-      v
-    ToolRegistry
-      |
-      v
-    deterministic tools
-
-Only implemented tools are registered here.
-
-Future capabilities such as Playwright, SPARQL, API access, email,
-database operations, hashing, monitoring, and scheduling will be added
-when their implementations are ready.
-
-The model never receives tools that are not currently implemented.
+Future tools are intentionally not registered until their implementations
+are ready. This keeps the model's available tool list accurate and prevents
+the model from attempting unavailable capabilities.
 """
 
 from __future__ import annotations
 
-from tools import file_tools
-from tools import http_tools
-from tools import validation_tools
-
+from tools import file_tools, http_tools, validation_tools
 from tools.registry import ToolRegistry, ToolSpec
 
 
 def build_registry() -> ToolRegistry:
-    """
-    Build and return the Phase-1 tool registry.
-
-    The registry contains only deterministic tools that are currently
-    implemented and safe for the agent to execute.
-
-    Returns:
-        ToolRegistry: Registry containing all currently enabled tools.
-    """
+    """Construct and return the controlled tool registry."""
 
     registry = ToolRegistry()
 
-    # =============================================================
-    # PHASE 1
-    # HTTP / FILE EXTRACTION
-    # =============================================================
+    # ------------------------------------------------------------------
+    # Phase 1: HTTP / file / validation tools
+    # ------------------------------------------------------------------
 
     registry.register(
         ToolSpec(
             name="http_download",
             description=(
-                "Download a file from a URL using HTTP GET and "
-                "save it to the configured local storage location."
+                "Download a file from a URL using HTTP GET and save it "
+                "as a raw artifact for the specified source. The agent "
+                "must provide the source_id and filename. The storage "
+                "directory is controlled by the application."
             ),
             category="http",
             function=http_tools.http_download,
@@ -64,13 +38,20 @@ def build_registry() -> ToolRegistry:
                 "properties": {
                     "url": {
                         "type": "string",
-                        "description": "URL of the file to download.",
+                        "description": "URL to download.",
                     },
-                    "save_path": {
+                    "source_id": {
                         "type": "string",
                         "description": (
-                            "Path relative to the configured storage "
-                            "root where the downloaded file should be saved."
+                            "Configured source identifier. "
+                            "Used to determine the raw storage directory."
+                        ),
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": (
+                            "Filename for the downloaded raw artifact. "
+                            "Must be a filename only, not a directory path."
                         ),
                     },
                     "timeout": {
@@ -82,7 +63,8 @@ def build_registry() -> ToolRegistry:
                 },
                 "required": [
                     "url",
-                    "save_path",
+                    "source_id",
+                    "filename",
                 ],
                 "additionalProperties": False,
             },
@@ -90,17 +72,13 @@ def build_registry() -> ToolRegistry:
         )
     )
 
-    # =============================================================
-    # FILE INSPECTION
-    # =============================================================
-
     registry.register(
         ToolSpec(
             name="inspect_file",
             description=(
-                "Inspect a downloaded file and return compact metadata "
-                "such as filename, extension, size, MIME type, and "
-                "available Excel sheets."
+                "Inspect a local file and return compact metadata "
+                "such as size, extension, MIME type, and spreadsheet "
+                "sheet names."
             ),
             category="file",
             function=file_tools.inspect_file,
@@ -109,31 +87,23 @@ def build_registry() -> ToolRegistry:
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": (
-                            "Path relative to the configured storage root."
-                        ),
+                        "description": "Local file path.",
                     },
                 },
-                "required": [
-                    "path",
-                ],
+                "required": ["path"],
                 "additionalProperties": False,
             },
             enabled=True,
         )
     )
 
-    # =============================================================
-    # CSV
-    # =============================================================
-
     registry.register(
         ToolSpec(
             name="read_csv",
             description=(
-                "Read a CSV file and return a compact structural summary "
-                "including row count, column names, data types, and a "
-                "small sample of rows."
+                "Read a CSV file and return a compact summary "
+                "containing shape, columns, data types, and a "
+                "small row sample."
             ),
             category="file",
             function=file_tools.read_csv,
@@ -142,40 +112,28 @@ def build_registry() -> ToolRegistry:
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": (
-                            "Path relative to the configured storage root."
-                        ),
+                        "description": "Local CSV file path.",
                     },
                     "sample_rows": {
                         "type": "integer",
-                        "description": (
-                            "Number of rows to return in the sample."
-                        ),
+                        "description": "Number of sample rows.",
                         "default": 5,
                         "minimum": 1,
-                        "maximum": 100,
                     },
                 },
-                "required": [
-                    "path",
-                ],
+                "required": ["path"],
                 "additionalProperties": False,
             },
             enabled=True,
         )
     )
 
-    # =============================================================
-    # EXCEL
-    # =============================================================
-
     registry.register(
         ToolSpec(
             name="read_excel",
             description=(
-                "Read an Excel workbook and return a compact structural "
-                "summary including sheets, columns, data types, and a "
-                "small sample of rows."
+                "Read an Excel file and return a compact summary "
+                "of sheets, shape, columns, data types, and samples."
             ),
             category="file",
             function=file_tools.read_excel,
@@ -184,49 +142,35 @@ def build_registry() -> ToolRegistry:
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": (
-                            "Path relative to the configured storage root."
-                        ),
+                        "description": "Local Excel file path.",
                     },
                     "sheet_name": {
-                        "type": [
-                            "string",
-                            "null",
-                        ],
+                        "type": ["string", "null"],
                         "description": (
-                            "Excel sheet to inspect. If omitted, "
-                            "the first sheet is used."
+                            "Optional sheet name. "
+                            "Defaults to the first sheet."
                         ),
                     },
                     "sample_rows": {
                         "type": "integer",
-                        "description": (
-                            "Number of rows to return in the sample."
-                        ),
+                        "description": "Number of sample rows.",
                         "default": 5,
                         "minimum": 1,
-                        "maximum": 100,
                     },
                 },
-                "required": [
-                    "path",
-                ],
+                "required": ["path"],
                 "additionalProperties": False,
             },
             enabled=True,
         )
     )
 
-    # =============================================================
-    # PDF TEXT
-    # =============================================================
-
     registry.register(
         ToolSpec(
             name="read_pdf",
             description=(
-                "Read text from a PDF and return compact information "
-                "about its pages and extracted text."
+                "Extract text from the first N pages of a PDF "
+                "and return page count plus compact text samples."
             ),
             category="file",
             function=file_tools.read_pdf,
@@ -235,39 +179,28 @@ def build_registry() -> ToolRegistry:
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": (
-                            "Path relative to the configured storage root."
-                        ),
+                        "description": "Local PDF file path.",
                     },
                     "max_pages": {
                         "type": "integer",
-                        "description": (
-                            "Maximum number of PDF pages to inspect."
-                        ),
+                        "description": "Maximum pages to inspect.",
                         "default": 3,
                         "minimum": 1,
-                        "maximum": 50,
                     },
                 },
-                "required": [
-                    "path",
-                ],
+                "required": ["path"],
                 "additionalProperties": False,
             },
             enabled=True,
         )
     )
 
-    # =============================================================
-    # PDF TABLE EXTRACTION
-    # =============================================================
-
     registry.register(
         ToolSpec(
             name="extract_pdf_table",
             description=(
-                "Extract tables from a PDF page and return a compact "
-                "representation of the detected table data."
+                "Extract tables from a single PDF page and return "
+                "a compact table summary and sample rows."
             ),
             category="file",
             function=file_tools.extract_pdf_table,
@@ -276,38 +209,28 @@ def build_registry() -> ToolRegistry:
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": (
-                            "Path relative to the configured storage root."
-                        ),
+                        "description": "Local PDF file path.",
                     },
                     "page_number": {
                         "type": "integer",
-                        "description": (
-                            "One-based PDF page number."
-                        ),
+                        "description": "1-indexed PDF page number.",
                         "default": 1,
                         "minimum": 1,
                     },
                 },
-                "required": [
-                    "path",
-                ],
+                "required": ["path"],
                 "additionalProperties": False,
             },
             enabled=True,
         )
     )
 
-    # =============================================================
-    # VALIDATION
-    # =============================================================
-
     registry.register(
         ToolSpec(
             name="validate_required_fields",
             description=(
-                "Check whether all required fields exist in a dataset's "
-                "column list."
+                "Check whether required fields are present "
+                "in a list of column names."
             ),
             category="validation",
             function=validation_tools.validate_required_fields,
@@ -316,15 +239,11 @@ def build_registry() -> ToolRegistry:
                 "properties": {
                     "columns": {
                         "type": "array",
-                        "items": {
-                            "type": "string",
-                        },
+                        "items": {"type": "string"},
                     },
                     "required_fields": {
                         "type": "array",
-                        "items": {
-                            "type": "string",
-                        },
+                        "items": {"type": "string"},
                     },
                 },
                 "required": [
@@ -337,16 +256,12 @@ def build_registry() -> ToolRegistry:
         )
     )
 
-    # =============================================================
-    # ROW COUNT VALIDATION
-    # =============================================================
-
     registry.register(
         ToolSpec(
             name="validate_row_count",
             description=(
-                "Validate that a dataset row count falls within an "
-                "expected minimum and optional maximum."
+                "Check that a row count falls within "
+                "an expected minimum and maximum."
             ),
             category="validation",
             function=validation_tools.validate_row_count,
@@ -359,20 +274,15 @@ def build_registry() -> ToolRegistry:
                     },
                     "minimum": {
                         "type": "integer",
-                        "minimum": 0,
                         "default": 1,
+                        "minimum": 0,
                     },
                     "maximum": {
-                        "type": [
-                            "integer",
-                            "null",
-                        ],
+                        "type": ["integer", "null"],
                         "minimum": 0,
                     },
                 },
-                "required": [
-                    "row_count",
-                ],
+                "required": ["row_count"],
                 "additionalProperties": False,
             },
             enabled=True,
