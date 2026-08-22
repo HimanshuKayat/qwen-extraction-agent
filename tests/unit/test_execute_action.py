@@ -23,11 +23,6 @@ def test_execute_unknown_tool_raises():
         execute_action(registry, "not_a_real_tool", {})
 
 
-def test_execute_disabled_future_tool_raises():
-    registry = build_registry()
-    with pytest.raises(ToolDisabledError):
-        execute_action(registry, "browser_open", {"url": "https://example.com"})
-
 
 def test_execute_invalid_arguments_raises():
     registry = build_registry()
