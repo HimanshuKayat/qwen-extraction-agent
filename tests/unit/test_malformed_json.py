@@ -1,58 +1,100 @@
-"""Unit tests for agent.prompts.parse_model_action: the model output
-contract must be strictly enforced, and malformed output must never be
-silently executed.
-"""
+"""Unit tests for the model action parser."""
 
 import pytest
 
-from agent.prompts import parse_model_action
-from core.exceptions import ModelOutputParseError
+from agent.parser import AgentResponseError, parse_action
 
 
 def test_parse_valid_action():
-    raw = '{"action": "http_download", "arguments": {"url": "https://x", "save_path": "y"}}'
-    parsed = parse_model_action(raw)
+    raw = (
+        '{"action": "http_download", '
+        '"arguments": {'
+        '"url": "https://x", '
+        '"save_path": "y"'
+        '}}'
+    )
+
+    parsed = parse_action(raw)
+
     assert parsed["action"] == "http_download"
     assert parsed["arguments"]["url"] == "https://x"
-
-
-def test_parse_strips_markdown_fence():
-    raw = '```json\n{"action": "finish", "arguments": {"reason": "ok"}}\n```'
-    parsed = parse_model_action(raw)
-    assert parsed["action"] == "finish"
+    assert parsed["arguments"]["save_path"] == "y"
 
 
 def test_parse_missing_action_key_raises():
     raw = '{"arguments": {}}'
-    with pytest.raises(ModelOutputParseError):
-        parse_model_action(raw)
+
+    with pytest.raises(AgentResponseError):
+        parse_action(raw)
 
 
 def test_parse_non_json_raises():
     raw = "I will now call http_download with the url."
-    with pytest.raises(ModelOutputParseError):
-        parse_model_action(raw)
+
+    with pytest.raises(AgentResponseError):
+        parse_action(raw)
 
 
 def test_parse_json_array_raises():
     raw = '[{"action": "finish", "arguments": {}}]'
-    with pytest.raises(ModelOutputParseError):
-        parse_model_action(raw)
+
+    with pytest.raises(AgentResponseError):
+        parse_action(raw)
 
 
 def test_parse_action_wrong_type_raises():
     raw = '{"action": 123, "arguments": {}}'
-    with pytest.raises(ModelOutputParseError):
-        parse_model_action(raw)
+
+    with pytest.raises(AgentResponseError):
+        parse_action(raw)
 
 
 def test_parse_arguments_wrong_type_raises():
     raw = '{"action": "finish", "arguments": "not-a-dict"}'
-    with pytest.raises(ModelOutputParseError):
-        parse_model_action(raw)
+
+    with pytest.raises(AgentResponseError):
+        parse_action(raw)
 
 
 def test_parse_defaults_missing_arguments_to_empty_dict():
     raw = '{"action": "finish"}'
-    parsed = parse_model_action(raw)
+
+    parsed = parse_action(raw)
+
+    assert parsed["action"] == "finish"
     assert parsed["arguments"] == {}
+
+
+def test_parse_markdown_fence_is_rejected():
+    raw = (
+        "```json\n"
+        '{"action": "finish", "arguments": {"reason": "ok"}}'
+        "\n```"
+    )
+
+    with pytest.raises(AgentResponseError):
+        parse_action(raw)
+
+
+def test_parse_empty_output_raises():
+    raw = ""
+
+    with pytest.raises(AgentResponseError):
+        parse_action(raw)
+
+
+def test_parse_invalid_json_raises():
+    raw = '{"action": "finish", "arguments": '
+
+    with pytest.raises(AgentResponseError):
+        parse_action(raw)
+
+
+def test_parse_extra_text_around_json_raises():
+    raw = (
+        'Here is the action: '
+        '{"action": "finish", "arguments": {}}'
+    )
+
+    with pytest.raises(AgentResponseError):
+        parse_action(raw)
