@@ -1,54 +1,113 @@
-"""Unit tests for tools.registry.execute_action: the single controlled
-entry point from model decision to real execution.
-"""
+"""Unit tests for tools.registry.execute_action."""
 
 import pytest
 
-from core.exceptions import InvalidArgumentsError, ToolDisabledError, ToolNotFoundError
+from core.exceptions import (
+    InvalidArgumentsError,
+    ToolDisabledError,
+    ToolNotFoundError,
+)
 from tools.definitions import build_registry
-from tools.registry import FINISH_ACTION, execute_action
+from tools.registry import execute_action
 
 
 def test_execute_finish_action_does_not_touch_tools():
     registry = build_registry()
-    result = execute_action(registry, FINISH_ACTION, {"reason": "done"})
+
+    result = execute_action(
+        registry,
+        "finish",
+        {"reason": "done"},
+    )
+
     assert result["success"] is True
-    assert result["action"] == FINISH_ACTION
+    assert result["action"] == "finish"
     assert result["reason"] == "done"
 
 
 def test_execute_unknown_tool_raises():
     registry = build_registry()
-    with pytest.raises(ToolNotFoundError):
-        execute_action(registry, "not_a_real_tool", {})
 
+    with pytest.raises(ToolNotFoundError):
+        execute_action(
+            registry,
+            "does_not_exist",
+            {},
+        )
+
+
+def test_execute_disabled_future_tool_raises():
+    """Future tools are not registered until implemented.
+
+    Therefore an unavailable future tool currently raises
+    ToolNotFoundError rather than executing anything.
+    """
+    registry = build_registry()
+
+    with pytest.raises(ToolNotFoundError):
+        execute_action(
+            registry,
+            "browser_open",
+            {"url": "https://example.com"},
+        )
 
 
 def test_execute_invalid_arguments_raises():
     registry = build_registry()
-    # http_download requires 'url' and 'save_path'; omit both.
+
     with pytest.raises(InvalidArgumentsError):
-        execute_action(registry, "http_download", {})
+        execute_action(
+            registry,
+            "http_download",
+            {
+                "url": "https://example.com",
+                "save_path": "invalid.bin",
+            },
+        )
 
 
 def test_execute_invalid_argument_types_raises():
     registry = build_registry()
+
     with pytest.raises(InvalidArgumentsError):
-        execute_action(registry, "http_download", {"url": 123, "save_path": "x"})
+        execute_action(
+            registry,
+            "http_download",
+            {
+                "url": "https://example.com",
+                "source_id": 123,
+                "filename": "test.bin",
+            },
+        )
 
 
-def test_execute_tool_runtime_error_is_structured_not_raised(monkeypatch):
-    """A tool that raises at runtime should produce a structured failure
-    result, not crash execute_action.
+def test_execute_tool_runtime_error_is_structured_not_raised(
+    monkeypatch,
+):
+    """A tool that raises at runtime should produce a structured
+    failure result instead of crashing execute_action.
     """
+
     registry = build_registry()
 
     def broken_download(**kwargs):
         raise RuntimeError("simulated failure")
 
-    registry.get("http_download").function = broken_download
+    registry.get(
+        "http_download"
+    ).function = broken_download
 
-    result = execute_action(registry, "http_download", {"url": "https://example.com", "save_path": "x/y.bin"})
+    result = execute_action(
+        registry,
+        "http_download",
+        {
+            "url": "https://example.com",
+            "source_id": "test_source",
+            "filename": "test.bin",
+        },
+    )
+
     assert result["success"] is False
     assert result["error_type"] == "RuntimeError"
-    assert "simulated failure" in result["message"]
+    assert result["message"] == "simulated failure"
+    assert result["recoverable"] is True
