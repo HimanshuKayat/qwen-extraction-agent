@@ -1,3 +1,15 @@
+"""
+Prompt construction for the autonomous extraction agent.
+
+This module is responsible only for building messages sent to the model.
+
+It does NOT:
+- execute tools
+- parse model JSON
+- access files
+- perform extraction
+"""
+
 from __future__ import annotations
 
 import json
@@ -7,61 +19,82 @@ from typing import Any
 def build_tool_selection_messages(
     source_config: dict[str, Any],
     tool_descriptions: list[dict[str, Any]],
+    tool_history: list[dict[str, Any]] | None = None,
+    observations: list[Any] | None = None,
 ) -> list[dict[str, str]]:
     """
-    Build the messages used when asking Qwen to select
-    the next deterministic tool.
+    Build the messages for one tool-selection turn.
+
+    The model receives:
+        1. Its role and behavioral constraints.
+        2. The source configuration.
+        3. The currently available tools.
+        4. Previous tool executions.
+        5. Observations/results from previous steps.
+
+    The model must return exactly one JSON action.
     """
 
+    if tool_history is None:
+        tool_history = []
+
+    if observations is None:
+        observations = []
+
     system_prompt = """
-You are an autonomous data-extraction agent.
+You are the autonomous decision-making agent for a data extraction system.
 
-Your job is to select exactly ONE action from the
-currently available tools.
+Your job is to choose the SINGLE best next action required to extract,
+inspect, or validate data from the provided source.
 
-You are the reasoning/controller layer.
+You are the reasoning and decision layer.
 
 You do NOT execute Python.
 You do NOT execute shell commands.
 You do NOT directly manipulate files.
-You do NOT generate large datasets.
+You do NOT invent tools.
+You do NOT call tools that are not listed.
+You do NOT generate or recreate large datasets yourself.
 
-Instead, select a controlled deterministic tool.
+Instead, choose exactly ONE controlled deterministic tool.
+
+The tool execution layer will execute your selected action and return
+the result to you on the next turn.
 
 IMPORTANT OUTPUT RULES:
 
-1. Return ONLY valid JSON.
-2. Do NOT return <think>.
-3. Do NOT return markdown.
-4. Do NOT return explanations.
-5. Do NOT put text before or after the JSON.
-6. Use ONLY tools listed below.
-7. Use ONLY arguments defined by the selected tool.
+Return ONLY valid JSON.
 
-Required format:
+Do NOT return:
+- <think>
+- </think>
+- markdown
+- code fences
+- explanations
+- comments
+- natural-language text before the JSON
+- natural-language text after the JSON
+
+Your response MUST have this structure:
 
 {
   "action": "tool_name",
-  "arguments": {
-    "argument_name": "value"
-  }
+  "arguments": {}
 }
 
-If the extraction process is complete, use:
+When the extraction process is complete, use:
 
 {
   "action": "finish",
   "arguments": {
-    "reason": "..."
+    "reason": "short explanation"
   }
 }
-""".strip()
 
-    tools_json = json.dumps(
-        tool_descriptions,
-        indent=2,
-        ensure_ascii=False,
-    )
+Choose exactly ONE action per turn.
+
+Use only arguments accepted by the selected tool.
+""".strip()
 
     source_json = json.dumps(
         source_config,
@@ -69,22 +102,48 @@ If the extraction process is complete, use:
         ensure_ascii=False,
     )
 
+    tools_json = json.dumps(
+        tool_descriptions,
+        indent=2,
+        ensure_ascii=False,
+    )
+
+    history_json = json.dumps(
+        tool_history,
+        indent=2,
+        ensure_ascii=False,
+    )
+
+    observations_json = json.dumps(
+        observations,
+        indent=2,
+        ensure_ascii=False,
+    )
+
     user_prompt = f"""
-AVAILABLE TOOLS:
-
-{tools_json}
-
 SOURCE CONFIGURATION:
 
 {source_json}
 
-Determine the single best next action.
 
-Remember:
+AVAILABLE TOOLS:
 
-- Return ONLY JSON.
-- Select exactly one available tool.
-- Do not explain your decision.
+{tools_json}
+
+
+PREVIOUS TOOL CALLS:
+
+{history_json}
+
+
+OBSERVATIONS FROM PREVIOUS STEPS:
+
+{observations_json}
+
+
+Choose the single best next action.
+
+Return ONLY valid JSON.
 """.strip()
 
     return [
