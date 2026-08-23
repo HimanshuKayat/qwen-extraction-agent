@@ -3,7 +3,7 @@
 The model receives a webpage source and should select browser_open
 as its first action.
 
-This verifies:
+This test verifies:
 
     source configuration
         ↓
@@ -15,7 +15,7 @@ This verifies:
         ↓
     action parser
 
-It does not execute the browser.
+The browser itself is NOT executed in this test.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ import pytest
 
 from agent.model import QwenModel
 from agent.parser import parse_action
-from agent.prompts import build_prompt
+from agent.prompts import build_tool_selection_messages
 from tools.definitions import build_registry
 
 
@@ -50,16 +50,19 @@ def test_qwen_selects_browser_open():
         "target_schema": {},
     }
 
-    # Use the current prompt-building API.
-    prompt = build_prompt(
+    messages = build_tool_selection_messages(
         source_config=source_config,
-        tools=registry.to_prompt_list(),
+        tool_descriptions=registry.to_prompt_list(),
         tool_history=[],
         observations=[],
     )
 
+    system_prompt = messages[0]["content"]
+    user_prompt = messages[1]["content"]
+
     raw_output = model.generate(
-        prompt,
+        system_prompt,
+        user_prompt,
         mode="tool_selection",
     )
 
@@ -73,6 +76,7 @@ def test_qwen_selects_browser_open():
         json.dumps(
             parsed,
             indent=2,
+            ensure_ascii=False,
         )
     )
 
