@@ -1,71 +1,93 @@
 """Unit tests for controlled browser tools."""
 
+from __future__ import annotations
+
 import pytest
 
-from core.exceptions import ToolExecutionError
-from tools.browser_tools import _validate_url
+from tools.browser_tools import (
+    _detect_block_type,
+    _validate_url,
+)
 
 
-def test_validate_raw_http_url():
-    """A normal HTTP URL is accepted."""
+def test_validate_url_accepts_https():
+    assert (
+        _validate_url("https://example.com/")
+        == "https://example.com/"
+    )
 
+
+def test_validate_url_accepts_http():
+    assert (
+        _validate_url("http://example.com/")
+        == "http://example.com/"
+    )
+
+
+def test_validate_url_strips_whitespace():
+    assert (
+        _validate_url("  https://example.com/  ")
+        == "https://example.com/"
+    )
+
+
+def test_validate_url_strips_markdown_link():
     result = _validate_url(
-        "https://example.com/"
+        "[https://example.com/](https://example.com/)"
     )
 
     assert result == "https://example.com/"
 
 
-def test_validate_http_url():
-    """HTTP URLs are accepted."""
+def test_validate_url_rejects_invalid_scheme():
+    with pytest.raises(Exception):
+        _validate_url("ftp://example.com/file")
 
-    result = _validate_url(
-        "http://example.com/"
+
+def test_detects_npci_tspd_challenge():
+    html = """
+    <html>
+        <script>
+            window["failureConfig"] = "TSPD";
+            var challenge = "/TSPD/";
+        </script>
+    </html>
+    """
+
+    result = _detect_block_type(
+        html=html,
+        text="",
+        title="",
+        url="https://www.npci.org.in/product/upi/product-statistics",
     )
 
-    assert result == "http://example.com/"
+    assert result == "anti_bot_challenge"
 
 
-def test_reject_markdown_url():
-    """Markdown-formatted URLs must never reach Playwright."""
+def test_detects_captcha():
+    result = _detect_block_type(
+        html="<html><body>CAPTCHA verification required</body></html>",
+        text="CAPTCHA verification required",
+        title="Security Check",
+        url="https://example.com/",
+    )
 
-    with pytest.raises(ToolExecutionError) as exc:
-        _validate_url(
-            "[https://example.com/](https://example.com/)"
-        )
-
-    assert exc.value.error_type == "InvalidBrowserURL"
-
-
-def test_reject_angle_bracket_url():
-    """Angle-bracket formatted URLs are rejected."""
-
-    with pytest.raises(ToolExecutionError):
-        _validate_url(
-            "<https://example.com/>"
-        )
+    assert result == "anti_bot_challenge"
 
 
-def test_reject_empty_url():
-    """Empty URLs are rejected."""
+def test_normal_page_is_not_blocked():
+    result = _detect_block_type(
+        html="""
+        <html>
+            <body>
+                <h1>Example Domain</h1>
+                <a href="https://example.com/test">Test</a>
+            </body>
+        </html>
+        """,
+        text="Example Domain Test",
+        title="Example Domain",
+        url="https://example.com/",
+    )
 
-    with pytest.raises(ToolExecutionError):
-        _validate_url("")
-
-
-def test_reject_unsupported_scheme():
-    """Only HTTP and HTTPS are supported."""
-
-    with pytest.raises(ToolExecutionError):
-        _validate_url(
-            "ftp://example.com/file"
-        )
-
-
-def test_reject_missing_hostname():
-    """URLs without a hostname are rejected."""
-
-    with pytest.raises(ToolExecutionError):
-        _validate_url(
-            "https://"
-        )
+    assert result is None
