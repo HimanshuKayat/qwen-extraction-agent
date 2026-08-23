@@ -22,8 +22,6 @@ async def test_browser_open():
 
 @pytest.mark.asyncio
 async def test_browser_inspect():
-    # Open the page because tests should not depend
-    # on another test having created a browser session.
     await browser_open(
         "https://example.com"
     )
