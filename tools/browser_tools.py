@@ -3,48 +3,14 @@ Controlled browser tools.
 
 Phase 2 foundation.
 
-Uses Playwright's asynchronous API so the browser layer works correctly
-inside Jupyter/Colab as well as in an asynchronous server environment.
-
-The model chooses browser actions. Playwright performs the actual browser
-operation.
-""""""
-Controlled browser tools.
-
-Phase 2 foundation.
-
-The public tool functions are synchronous so they can be called safely
-by the synchronous agent/tool-registry layer.
-
-Internally, Playwright runs on one persistent asyncio event loop in a
-dedicated background thread. This is important because a Playwright
-Browser/Page must remain associated with the same event loop for the
-entire browser session.
-
-Architecture:
-
-    Agent
-      |
-      v
-    execute_action()
-      |
-      v
-    browser_open()
-      |
-      v
-    PersistentAsyncRunner
-      |
-      v
-    Playwright asyncio loop
-      |
-      v
-    Chromium
+Playwright runs on one persistent asyncio event loop in a dedicated
+background thread. Public browser tools are synchronous so they can be
+called safely by the synchronous agent/tool-registry layer.
 """
 
 from __future__ import annotations
 
 import asyncio
-import inspect
 import threading
 from typing import Any, Coroutine, TypeVar
 from urllib.parse import urlparse
@@ -60,19 +26,20 @@ from core.exceptions import ToolExecutionError
 
 
 DEFAULT_TIMEOUT_SECONDS = 30
+INSPECT_TIMEOUT_SECONDS = 10
 MAX_INSPECT_TEXT = 20_000
 MAX_INSPECT_LINKS = 200
 
 T = TypeVar("T")
 
 
-def _validate_url(url: str) -> str:
-    """
-    Validate a browser URL.
+# ---------------------------------------------------------------------------
+# URL VALIDATION
+# ---------------------------------------------------------------------------
 
-    Only raw HTTP/HTTPS URLs are accepted.
-    Markdown-formatted URLs are explicitly rejected.
-    """
+
+def _validate_url(url: str) -> str:
+    """Validate that a browser URL is a raw HTTP/HTTPS URL."""
 
     if not isinstance(url, str):
         raise ToolExecutionError(
@@ -101,7 +68,7 @@ def _validate_url(url: str) -> str:
             recoverable=False,
         )
 
-    # Reject angle-bracket URLs.
+    # Reject angle-bracket links.
     if url.startswith("<") and url.endswith(">"):
         raise ToolExecutionError(
             message=(
@@ -134,14 +101,17 @@ def _validate_url(url: str) -> str:
     return url
 
 
+# ---------------------------------------------------------------------------
+# PERSISTENT ASYNC RUNNER
+# ---------------------------------------------------------------------------
+
+
 class AsyncRunner:
     """
-    Own one persistent asyncio event loop in a background thread.
+    Persistent asyncio event loop for Playwright.
 
-    Every Playwright operation is submitted to this same loop.
-
-    This prevents browser/page objects from being used across different
-    asyncio event loops.
+    Browser/page objects are created and used on this same loop for the
+    entire lifetime of the browser session.
     """
 
     def __init__(self) -> None:
@@ -176,7 +146,7 @@ class AsyncRunner:
             loop.close()
 
     def start(self) -> None:
-        """Start the persistent event loop if necessary."""
+        """Start the persistent event loop."""
 
         with self._lock:
             if (
@@ -207,15 +177,13 @@ class AsyncRunner:
         coroutine: Coroutine[Any, Any, T],
         timeout: float | None = None,
     ) -> T:
-        """
-        Execute a coroutine on the persistent browser event loop.
-        """
+        """Run a coroutine on the persistent browser loop."""
 
         self.start()
 
         if self._loop is None:
             raise RuntimeError(
-                "Browser asyncio loop was not initialized."
+                "Browser asyncio loop is not available."
             )
 
         future = asyncio.run_coroutine_threadsafe(
@@ -233,7 +201,7 @@ class AsyncRunner:
             raise
 
     def stop(self) -> None:
-        """Stop the persistent event loop."""
+        """Stop the persistent browser loop."""
 
         with self._lock:
             loop = self._loop
@@ -243,16 +211,19 @@ class AsyncRunner:
             self._thread = None
 
         if loop is not None and loop.is_running():
-            loop.call_soon_threadsafe(
-                loop.stop
-            )
+            loop.call_soon_threadsafe(loop.stop)
 
         if thread is not None and thread.is_alive():
-            thread.join(timeout=10)
+            thread.join(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# BROWSER SESSION
+# ---------------------------------------------------------------------------
 
 
 class BrowserSession:
-    """Owns one persistent Playwright browser session."""
+    """Owns the Playwright browser and current page."""
 
     def __init__(self) -> None:
         self._playwright: Playwright | None = None
@@ -276,7 +247,6 @@ class BrowserSession:
             )
 
         try:
-            # Close an existing browser first.
             await self.close_async()
 
             self._playwright = await async_playwright().start()
@@ -318,7 +288,12 @@ class BrowserSession:
             ) from exc
 
     async def inspect_async(self) -> dict[str, Any]:
-        """Inspect the currently open page."""
+        """
+        Inspect the current page.
+
+        Every browser operation has its own timeout. This prevents one
+        Playwright operation from blocking the agent indefinitely.
+        """
 
         if self._page is None:
             raise ToolExecutionError(
@@ -327,81 +302,127 @@ class BrowserSession:
                 recoverable=False,
             )
 
+        page = self._page
+
+        # ---------------------------------------------------------------
+        # TITLE
+        # ---------------------------------------------------------------
+
         try:
-            title = await self._page.title()
-            url = self._page.url
-
-            body = self._page.locator("body")
-
-            text = await body.inner_text(
-                timeout=10_000,
+            title = await asyncio.wait_for(
+                page.title(),
+                timeout=INSPECT_TIMEOUT_SECONDS,
             )
-
-            links = await self._page.locator(
-                "a"
-            ).evaluate_all(
-                """
-                elements => elements.map(a => ({
-                    text: (a.innerText || "").trim(),
-                    href: a.href
-                })).filter(x => x.href)
-                """
-            )
-
-            return {
-                "success": True,
-                "url": url,
-                "title": title,
-                "text": text[:MAX_INSPECT_TEXT],
-                "links": links[:MAX_INSPECT_LINKS],
-                "link_count": len(links),
-            }
-
         except Exception as exc:
             raise ToolExecutionError(
-                message=f"Browser inspection failed: {exc}",
-                error_type="BrowserInspectError",
+                message=f"Failed to read page title: {exc}",
+                error_type="BrowserInspectTitleError",
                 recoverable=True,
             ) from exc
 
+        # ---------------------------------------------------------------
+        # URL
+        # ---------------------------------------------------------------
+
+        try:
+            url = page.url
+        except Exception as exc:
+            raise ToolExecutionError(
+                message=f"Failed to read page URL: {exc}",
+                error_type="BrowserInspectURLError",
+                recoverable=True,
+            ) from exc
+
+        # ---------------------------------------------------------------
+        # PAGE TEXT
+        # ---------------------------------------------------------------
+
+        try:
+            text = await asyncio.wait_for(
+                page.locator("body").inner_text(
+                    timeout=INSPECT_TIMEOUT_SECONDS * 1000,
+                ),
+                timeout=INSPECT_TIMEOUT_SECONDS + 2,
+            )
+
+        except Exception as exc:
+            raise ToolExecutionError(
+                message=f"Failed to extract page text: {exc}",
+                error_type="BrowserInspectTextError",
+                recoverable=True,
+            ) from exc
+
+        # ---------------------------------------------------------------
+        # LINKS
+        # ---------------------------------------------------------------
+
+        try:
+            links = await asyncio.wait_for(
+                page.locator("a").evaluate_all(
+                    """
+                    elements => elements.map(a => ({
+                        text: (a.innerText || "").trim(),
+                        href: a.href || ""
+                    })).filter(x => x.href)
+                    """
+                ),
+                timeout=INSPECT_TIMEOUT_SECONDS + 2,
+            )
+
+        except Exception as exc:
+            # Links are useful but not essential. If link extraction fails,
+            # return the page text rather than failing the entire inspection.
+            links = []
+
+        return {
+            "success": True,
+            "url": url,
+            "title": title,
+            "text": text[:MAX_INSPECT_TEXT],
+            "links": links[:MAX_INSPECT_LINKS],
+            "link_count": len(links),
+        }
+
     async def close_async(self) -> None:
-        """Close the browser session."""
+        """Close the browser and Playwright cleanly."""
 
-        try:
-            if self._browser is not None:
+        if self._browser is not None:
+            try:
                 await self._browser.close()
+            except Exception:
+                pass
 
-        except Exception:
-            pass
+        self._browser = None
+        self._page = None
 
-        finally:
-            self._browser = None
-            self._page = None
-
-        try:
-            if self._playwright is not None:
+        if self._playwright is not None:
+            try:
                 await self._playwright.stop()
+            except Exception:
+                pass
 
-        except Exception:
-            pass
+        self._playwright = None
 
-        finally:
-            self._playwright = None
+
+# ---------------------------------------------------------------------------
+# GLOBAL BROWSER SESSION
+# ---------------------------------------------------------------------------
 
 
 _BROWSER_RUNNER = AsyncRunner()
 _SESSION = BrowserSession()
 
 
+# ---------------------------------------------------------------------------
+# PUBLIC TOOLS
+# ---------------------------------------------------------------------------
+
+
 def browser_open(
     url: str,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
-    """
-    Open a website in the controlled browser.
-
-    Synchronous wrapper around the persistent Playwright event loop.
-    """
+    """Open a website in the controlled browser."""
 
     return _BROWSER_RUNNER.run(
         _SESSION.open_async(
@@ -413,27 +434,21 @@ def browser_open(
 
 
 def browser_inspect() -> dict[str, Any]:
-    """
-    Inspect the currently open browser page.
-
-    Synchronous wrapper around the persistent Playwright event loop.
-    """
+    """Inspect the currently open webpage."""
 
     return _BROWSER_RUNNER.run(
         _SESSION.inspect_async(),
-        timeout=20,
+        timeout=INSPECT_TIMEOUT_SECONDS + 5,
     )
 
 
 def browser_close() -> dict[str, Any]:
-    """
-    Close the current browser session.
-    """
+    """Close the current browser session."""
 
     try:
         _BROWSER_RUNNER.run(
             _SESSION.close_async(),
-            timeout=15,
+            timeout=10,
         )
 
         return {
@@ -443,268 +458,3 @@ def browser_close() -> dict[str, Any]:
 
     finally:
         _BROWSER_RUNNER.stop()
-
-
-# Keep this helper available for tests and diagnostics.
-def is_async_tool(function: Any) -> bool:
-    """Return whether a function is asynchronous."""
-
-    return inspect.iscoroutinefunction(function)
-
-from typing import Any
-from urllib.parse import urlparse
-
-from playwright.async_api import (
-    Browser,
-    Page,
-    Playwright,
-    async_playwright,
-)
-
-from core.exceptions import ToolExecutionError
-
-
-DEFAULT_TIMEOUT_SECONDS = 30
-MAX_INSPECT_TEXT = 20_000
-MAX_INSPECT_LINKS = 200
-
-
-def _validate_url(url: str) -> str:
-    """
-    Validate and normalize a browser URL.
-
-    Browser tools must receive a real URL, not Markdown such as:
-
-        [https://example.com/](https://example.com/)
-
-    Returns:
-        The validated URL.
-
-    Raises:
-        ToolExecutionError: If the URL is malformed or unsupported.
-    """
-
-    if not isinstance(url, str):
-        raise ToolExecutionError(
-            message="Browser URL must be a string.",
-            error_type="InvalidBrowserURL",
-            recoverable=False,
-        )
-
-    url = url.strip()
-
-    if not url:
-        raise ToolExecutionError(
-            message="Browser URL cannot be empty.",
-            error_type="InvalidBrowserURL",
-            recoverable=False,
-        )
-
-    # Explicitly reject common Markdown URL formats.
-    if url.startswith("[") or "](" in url:
-        raise ToolExecutionError(
-            message=(
-                "Browser URL must be a raw URL, not Markdown. "
-                f"Received: {url}"
-            ),
-            error_type="InvalidBrowserURL",
-            recoverable=False,
-        )
-
-    if url.startswith("<") and url.endswith(">"):
-        raise ToolExecutionError(
-            message=(
-                "Browser URL must be a raw URL, not an angle-bracket "
-                f"formatted URL. Received: {url}"
-            ),
-            error_type="InvalidBrowserURL",
-            recoverable=False,
-        )
-
-    parsed = urlparse(url)
-
-    if parsed.scheme not in {"http", "https"}:
-        raise ToolExecutionError(
-            message=(
-                "Browser URL must use http:// or https://. "
-                f"Received: {url}"
-            ),
-            error_type="InvalidBrowserURL",
-            recoverable=False,
-        )
-
-    if not parsed.netloc:
-        raise ToolExecutionError(
-            message=f"Browser URL has no valid hostname: {url}",
-            error_type="InvalidBrowserURL",
-            recoverable=False,
-        )
-
-    return url
-
-
-class BrowserSession:
-    """Owns one controlled Playwright browser session."""
-
-    def __init__(self) -> None:
-        self._playwright: Playwright | None = None
-        self._browser: Browser | None = None
-        self._page: Page | None = None
-
-    async def open(
-        self,
-        url: str,
-        timeout: int = DEFAULT_TIMEOUT_SECONDS,
-    ) -> dict[str, Any]:
-        """Open a URL in a controlled Chromium browser."""
-
-        url = _validate_url(url)
-
-        if timeout <= 0:
-            raise ToolExecutionError(
-                message="Browser timeout must be greater than zero.",
-                error_type="InvalidBrowserTimeout",
-                recoverable=False,
-            )
-
-        try:
-            # Close an existing session before opening a new one.
-            await self.close()
-
-            self._playwright = await async_playwright().start()
-
-            self._browser = await self._playwright.chromium.launch(
-                headless=True,
-            )
-
-            self._page = await self._browser.new_page()
-
-            response = await self._page.goto(
-                url,
-                wait_until="domcontentloaded",
-                timeout=timeout * 1000,
-            )
-
-            return {
-                "success": True,
-                "url": self._page.url,
-                "title": await self._page.title(),
-                "status_code": (
-                    response.status
-                    if response is not None
-                    else None
-                ),
-            }
-
-        except ToolExecutionError:
-            await self.close()
-            raise
-
-        except Exception as exc:
-            await self.close()
-
-            raise ToolExecutionError(
-                message=f"Browser failed to open {url}: {exc}",
-                error_type="BrowserOpenError",
-                recoverable=True,
-            ) from exc
-
-    async def inspect(self) -> dict[str, Any]:
-        """Inspect the currently open page."""
-
-        if self._page is None:
-            raise ToolExecutionError(
-                message="No browser page is currently open.",
-                error_type="BrowserSessionError",
-                recoverable=False,
-            )
-
-        try:
-            title = await self._page.title()
-            url = self._page.url
-
-            text = await self._page.locator(
-                "body"
-            ).inner_text(
-                timeout=10_000
-            )
-
-            links = await self._page.locator(
-                "a"
-            ).evaluate_all(
-                """
-                elements => elements.map(a => ({
-                    text: (a.innerText || "").trim(),
-                    href: a.href
-                })).filter(x => x.href)
-                """
-            )
-
-            return {
-                "success": True,
-                "url": url,
-                "title": title,
-                "text": text[:MAX_INSPECT_TEXT],
-                "links": links[:MAX_INSPECT_LINKS],
-                "link_count": len(links),
-            }
-
-        except Exception as exc:
-            raise ToolExecutionError(
-                message=f"Browser inspection failed: {exc}",
-                error_type="BrowserInspectError",
-                recoverable=True,
-            ) from exc
-
-    async def close(self) -> None:
-        """Close the browser session."""
-
-        try:
-            if self._browser is not None:
-                await self._browser.close()
-        except Exception:
-            # Cleanup must never mask the original operation error.
-            pass
-        finally:
-            self._browser = None
-            self._page = None
-
-            if self._playwright is not None:
-                try:
-                    await self._playwright.stop()
-                except Exception:
-                    pass
-
-            self._playwright = None
-
-
-_SESSION = BrowserSession()
-
-
-async def browser_open(
-    url: str,
-    timeout: int = DEFAULT_TIMEOUT_SECONDS,
-) -> dict[str, Any]:
-    """Open a website in the controlled browser."""
-
-    return await _SESSION.open(
-        url=url,
-        timeout=timeout,
-    )
-
-
-async def browser_inspect() -> dict[str, Any]:
-    """Inspect the currently open page."""
-
-    return await _SESSION.inspect()
-
-
-async def browser_close() -> dict[str, Any]:
-    """Close the current browser session."""
-
-    await _SESSION.close()
-
-    return {
-        "success": True,
-        "message": "Browser session closed.",
-    }
