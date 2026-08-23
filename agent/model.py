@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol, Any
+from typing import Any, Protocol
 
 import torch
 from transformers import (
@@ -14,9 +14,6 @@ from transformers import (
 class ModelClient(Protocol):
     """
     Interface expected by the agent loop.
-
-    Any model implementation used by the agent must expose
-    a generate() method with this interface.
     """
 
     def generate(
@@ -43,14 +40,7 @@ class QwenModel:
     """
     Qwen3-8B model implementation.
 
-    This class is responsible ONLY for model inference.
-
-    It does not:
-    - execute tools
-    - download files
-    - scrape websites
-    - validate datasets
-    - access databases
+    Responsible only for model inference.
     """
 
     DEFAULT_MODEL = "Qwen/Qwen3-8B"
@@ -59,28 +49,57 @@ class QwenModel:
         self,
         model_name: str = DEFAULT_MODEL,
         load_in_4bit: bool = True,
-        device_map: str | dict[str, Any] = "auto",
+        device_map: str = "cuda:0",
     ) -> None:
 
         self.model_name = model_name
         self.load_in_4bit = load_in_4bit
 
         # ---------------------------------------------------------
-        # Environment validation
+        # CUDA CHECK
         # ---------------------------------------------------------
 
         if not torch.cuda.is_available():
             raise RuntimeError(
-                "CUDA is required for Qwen3-8B in the current "
-                "configuration, but no CUDA GPU is available."
+                "CUDA is required for Qwen3-8B, "
+                "but no CUDA GPU is available."
             )
 
+        self.cuda_device = torch.device("cuda:0")
+
+        print("=" * 60)
+        print("QWEN MODEL INITIALIZATION")
+        print("=" * 60)
+        print("Model:", self.model_name)
+        print("CUDA:", torch.cuda.get_device_name(0))
+        print(
+            "GPU memory:",
+            round(
+                torch.cuda.get_device_properties(0).total_memory
+                / (1024 ** 3),
+                2,
+            ),
+            "GB",
+        )
+
+        # ---------------------------------------------------------
+        # TOKENIZER
+        # ---------------------------------------------------------
+
         self._tokenizer = self._load_tokenizer()
+
+        # ---------------------------------------------------------
+        # MODEL
+        # ---------------------------------------------------------
 
         self._model = self._load_model(
             load_in_4bit=load_in_4bit,
             device_map=device_map,
         )
+
+        # ---------------------------------------------------------
+        # GENERATION CONFIGS
+        # ---------------------------------------------------------
 
         self.generation_configs = {
             "tool_selection": GenerationConfig(
@@ -97,12 +116,17 @@ class QwenModel:
             ),
         }
 
+        print("QWEN MODEL LOADED")
+        print("DEVICE:", self.device)
+        print("GPU MEMORY:", self.gpu_memory())
+        print("=" * 60)
+
     # =============================================================
     # TOKENIZER
     # =============================================================
 
     def _load_tokenizer(self):
-        """Load the Qwen tokenizer."""
+        """Load tokenizer from Hugging Face."""
 
         return AutoTokenizer.from_pretrained(
             self.model_name,
@@ -110,28 +134,22 @@ class QwenModel:
         )
 
     # =============================================================
-    # MODEL
+    # MODEL LOADING
     # =============================================================
 
     def _load_model(
         self,
         load_in_4bit: bool,
-        device_map: str | dict[str, Any],
+        device_map: str,
     ):
         """
-        Load Qwen.
+        Load Qwen3-8B.
 
-        When using BitsAndBytes 4-bit quantization, we deliberately
-        place the model on the CUDA device rather than allowing
-        Accelerate's automatic device mapping to partially dispatch
-        modules to CPU.
+        For 4-bit inference we explicitly target cuda:0.
 
-        This avoids the error:
-
-            Some modules are dispatched on the CPU or the disk.
-
-        which occurs when a quantized model receives a mixed
-        GPU/CPU device map without the required offload settings.
+        We intentionally do NOT use device_map="auto" because
+        Transformers may decide to dispatch some modules to CPU,
+        which BitsAndBytes rejects for this configuration.
         """
 
         compute_dtype = torch.float16
@@ -146,38 +164,15 @@ class QwenModel:
                 bnb_4bit_use_double_quant=True,
             )
 
-            # -----------------------------------------------------
-            # IMPORTANT
-            #
-            # Do NOT let device_map="auto" create:
-            #
-            #     GPU + CPU
-            #
-            # for a 4-bit BitsAndBytes model.
-            #
-            # A T4 should load Qwen3-8B 4-bit entirely on GPU.
-            # -----------------------------------------------------
-
-            effective_device_map = {
-                "": 0,
-            }
+            effective_device_map = "cuda:0"
 
         else:
-            # For non-quantized loading we can retain the caller's
-            # requested device map.
             effective_device_map = device_map
 
-        print(
-            f"[QwenModel] Loading model: {self.model_name}"
-        )
-
-        print(
-            f"[QwenModel] 4-bit quantization: {load_in_4bit}"
-        )
-
-        print(
-            f"[QwenModel] Device map: {effective_device_map}"
-        )
+        print()
+        print("STARTING QWEN LOAD...")
+        print("4-bit:", load_in_4bit)
+        print("Device map:", effective_device_map)
 
         model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
@@ -201,17 +196,7 @@ class QwenModel:
         mode: str = "tool_selection",
     ) -> str:
         """
-        Generate a model response.
-
-        Args:
-            messages:
-                Chat messages in standard role/content format.
-
-            mode:
-                Generation configuration to use.
-
-        Returns:
-            Raw generated model text.
+        Generate a response from Qwen.
         """
 
         if mode not in self.generation_configs:
@@ -222,7 +207,7 @@ class QwenModel:
         config = self.generation_configs[mode]
 
         # ---------------------------------------------------------
-        # Build Qwen chat prompt
+        # CHAT TEMPLATE
         # ---------------------------------------------------------
 
         prompt = self._tokenizer.apply_chat_template(
@@ -233,7 +218,7 @@ class QwenModel:
         )
 
         # ---------------------------------------------------------
-        # Tokenize
+        # TOKENIZE
         # ---------------------------------------------------------
 
         inputs = self._tokenizer(
@@ -242,18 +227,16 @@ class QwenModel:
         )
 
         # ---------------------------------------------------------
-        # Move inputs to model device
+        # MOVE INPUTS TO CUDA
         # ---------------------------------------------------------
 
-        model_device = self._model.device
-
         inputs = {
-            key: value.to(model_device)
+            key: value.to(self.cuda_device)
             for key, value in inputs.items()
         }
 
         # ---------------------------------------------------------
-        # Generation configuration
+        # GENERATION PARAMETERS
         # ---------------------------------------------------------
 
         generation_kwargs = {
@@ -263,10 +246,12 @@ class QwenModel:
         }
 
         if config.do_sample:
-            generation_kwargs["temperature"] = config.temperature
+            generation_kwargs["temperature"] = (
+                config.temperature
+            )
 
         # ---------------------------------------------------------
-        # Generate
+        # GENERATE
         # ---------------------------------------------------------
 
         with torch.inference_mode():
@@ -276,7 +261,7 @@ class QwenModel:
             )
 
         # ---------------------------------------------------------
-        # Remove input tokens
+        # REMOVE PROMPT TOKENS
         # ---------------------------------------------------------
 
         input_length = inputs["input_ids"].shape[-1]
@@ -287,7 +272,7 @@ class QwenModel:
         ]
 
         # ---------------------------------------------------------
-        # Decode
+        # DECODE
         # ---------------------------------------------------------
 
         return self._tokenizer.decode(
@@ -301,19 +286,19 @@ class QwenModel:
 
     @property
     def model(self):
-        """Return the underlying Transformers model."""
+        """Return underlying Transformers model."""
 
         return self._model
 
     @property
     def tokenizer(self):
-        """Return the tokenizer."""
+        """Return tokenizer."""
 
         return self._tokenizer
 
     @property
     def device(self):
-        """Return the model device."""
+        """Return model device."""
 
         return self._model.device
 
@@ -322,7 +307,7 @@ class QwenModel:
     # =============================================================
 
     def gpu_memory(self) -> dict[str, float]:
-        """Return current GPU memory usage in GB."""
+        """Return current GPU memory usage."""
 
         if not torch.cuda.is_available():
             return {
@@ -332,11 +317,13 @@ class QwenModel:
 
         return {
             "allocated_gb": round(
-                torch.cuda.memory_allocated() / (1024 ** 3),
+                torch.cuda.memory_allocated()
+                / (1024 ** 3),
                 2,
             ),
             "reserved_gb": round(
-                torch.cuda.memory_reserved() / (1024 ** 3),
+                torch.cuda.memory_reserved()
+                / (1024 ** 3),
                 2,
             ),
         }
