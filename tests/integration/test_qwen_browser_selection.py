@@ -1,18 +1,32 @@
 """Integration test for Qwen browser tool selection.
 
-The model receives a webpage source and must select browser_open
+The model receives a webpage source and should select browser_open
 as its first action.
 
-This test verifies model -> JSON action parsing, not actual browser
-execution.
+This verifies:
+
+    source configuration
+        ↓
+    tool descriptions
+        ↓
+    Qwen
+        ↓
+    JSON response
+        ↓
+    action parser
+
+It does not execute the browser.
 """
+
+from __future__ import annotations
 
 import json
 
 import pytest
 
 from agent.model import QwenModel
-from agent.prompts import build_system_prompt, build_user_prompt, parse_model_action
+from agent.parser import parse_action
+from agent.prompts import build_prompt
 from tools.definitions import build_registry
 
 
@@ -36,26 +50,23 @@ def test_qwen_selects_browser_open():
         "target_schema": {},
     }
 
-    system_prompt = build_system_prompt(
-        registry.to_prompt_list()
-    )
-
-    user_prompt = build_user_prompt(
+    # Use the current prompt-building API.
+    prompt = build_prompt(
         source_config=source_config,
+        tools=registry.to_prompt_list(),
         tool_history=[],
         observations=[],
     )
 
     raw_output = model.generate(
-        system_prompt,
-        user_prompt,
+        prompt,
         mode="tool_selection",
     )
 
     print("\nRAW MODEL RESPONSE:")
     print(raw_output)
 
-    parsed = parse_model_action(raw_output)
+    parsed = parse_action(raw_output)
 
     print("\nPARSED ACTION:")
     print(
