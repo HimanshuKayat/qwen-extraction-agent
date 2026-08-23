@@ -1,4 +1,5 @@
-"""Controlled browser tools.
+"""
+Controlled browser tools.
 
 Phase 2 foundation.
 
@@ -12,6 +13,7 @@ operation.
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlparse
 
 from playwright.async_api import (
     Browser,
@@ -21,6 +23,85 @@ from playwright.async_api import (
 )
 
 from core.exceptions import ToolExecutionError
+
+
+DEFAULT_TIMEOUT_SECONDS = 30
+MAX_INSPECT_TEXT = 20_000
+MAX_INSPECT_LINKS = 200
+
+
+def _validate_url(url: str) -> str:
+    """
+    Validate and normalize a browser URL.
+
+    Browser tools must receive a real URL, not Markdown such as:
+
+        [https://example.com/](https://example.com/)
+
+    Returns:
+        The validated URL.
+
+    Raises:
+        ToolExecutionError: If the URL is malformed or unsupported.
+    """
+
+    if not isinstance(url, str):
+        raise ToolExecutionError(
+            message="Browser URL must be a string.",
+            error_type="InvalidBrowserURL",
+            recoverable=False,
+        )
+
+    url = url.strip()
+
+    if not url:
+        raise ToolExecutionError(
+            message="Browser URL cannot be empty.",
+            error_type="InvalidBrowserURL",
+            recoverable=False,
+        )
+
+    # Explicitly reject common Markdown URL formats.
+    if url.startswith("[") or "](" in url:
+        raise ToolExecutionError(
+            message=(
+                "Browser URL must be a raw URL, not Markdown. "
+                f"Received: {url}"
+            ),
+            error_type="InvalidBrowserURL",
+            recoverable=False,
+        )
+
+    if url.startswith("<") and url.endswith(">"):
+        raise ToolExecutionError(
+            message=(
+                "Browser URL must be a raw URL, not an angle-bracket "
+                f"formatted URL. Received: {url}"
+            ),
+            error_type="InvalidBrowserURL",
+            recoverable=False,
+        )
+
+    parsed = urlparse(url)
+
+    if parsed.scheme not in {"http", "https"}:
+        raise ToolExecutionError(
+            message=(
+                "Browser URL must use http:// or https://. "
+                f"Received: {url}"
+            ),
+            error_type="InvalidBrowserURL",
+            recoverable=False,
+        )
+
+    if not parsed.netloc:
+        raise ToolExecutionError(
+            message=f"Browser URL has no valid hostname: {url}",
+            error_type="InvalidBrowserURL",
+            recoverable=False,
+        )
+
+    return url
 
 
 class BrowserSession:
@@ -34,11 +115,23 @@ class BrowserSession:
     async def open(
         self,
         url: str,
-        timeout: int = 30,
+        timeout: int = DEFAULT_TIMEOUT_SECONDS,
     ) -> dict[str, Any]:
         """Open a URL in a controlled Chromium browser."""
 
+        url = _validate_url(url)
+
+        if timeout <= 0:
+            raise ToolExecutionError(
+                message="Browser timeout must be greater than zero.",
+                error_type="InvalidBrowserTimeout",
+                recoverable=False,
+            )
+
         try:
+            # Close an existing session before opening a new one.
+            await self.close()
+
             self._playwright = await async_playwright().start()
 
             self._browser = await self._playwright.chromium.launch(
@@ -63,6 +156,10 @@ class BrowserSession:
                     else None
                 ),
             }
+
+        except ToolExecutionError:
+            await self.close()
+            raise
 
         except Exception as exc:
             await self.close()
@@ -108,8 +205,8 @@ class BrowserSession:
                 "success": True,
                 "url": url,
                 "title": title,
-                "text": text[:20_000],
-                "links": links[:200],
+                "text": text[:MAX_INSPECT_TEXT],
+                "links": links[:MAX_INSPECT_LINKS],
                 "link_count": len(links),
             }
 
@@ -126,12 +223,18 @@ class BrowserSession:
         try:
             if self._browser is not None:
                 await self._browser.close()
+        except Exception:
+            # Cleanup must never mask the original operation error.
+            pass
         finally:
             self._browser = None
             self._page = None
 
             if self._playwright is not None:
-                await self._playwright.stop()
+                try:
+                    await self._playwright.stop()
+                except Exception:
+                    pass
 
             self._playwright = None
 
@@ -141,7 +244,7 @@ _SESSION = BrowserSession()
 
 async def browser_open(
     url: str,
-    timeout: int = 30,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     """Open a website in the controlled browser."""
 
