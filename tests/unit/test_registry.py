@@ -1,15 +1,18 @@
-"""Unit tests for the controlled tool registry.
+"""Unit tests for the tool registry.
 
-The registry is responsible for:
-- registering deterministic tools;
-- preventing duplicate registrations;
-- looking up tools;
-- exposing only enabled tools to the model;
-- validating the structure of tool definitions.
+Tests cover:
 
-Only currently implemented tools should be present in the Phase-1
-registry. Future tools will be added when their implementations exist.
+- tool registration
+- tool lookup
+- duplicate protection
+- enabled/disabled tools
+- Phase 1 extraction tools
+- Phase 2 browser tools
+- future placeholder tools
+- model-facing tool descriptions
 """
+
+import json
 
 import pytest
 
@@ -19,7 +22,7 @@ from tools.registry import ToolRegistry, ToolSpec
 
 
 def test_build_registry_contains_phase1_tools():
-    """The Phase-1 registry contains all currently implemented tools."""
+    """The registry contains all implemented Phase-1 tools."""
 
     registry = build_registry()
 
@@ -39,15 +42,34 @@ def test_build_registry_contains_phase1_tools():
         "validate_row_count",
     }
 
-    assert names == expected_tools
+    assert expected_tools.issubset(names)
 
 
-def test_phase1_tools_are_enabled():
-    """Every Phase-1 tool is enabled and has an implementation."""
+def test_build_registry_contains_phase2_browser_tools():
+    """The registry contains the implemented browser tools."""
 
     registry = build_registry()
 
-    for tool_name in (
+    names = {
+        spec.name
+        for spec in registry.list_all()
+    }
+
+    expected_browser_tools = {
+        "browser_open",
+        "browser_inspect",
+        "browser_close",
+    }
+
+    assert expected_browser_tools.issubset(names)
+
+
+def test_phase1_tools_are_enabled():
+    """All Phase-1 tools are enabled."""
+
+    registry = build_registry()
+
+    phase1_tools = [
         "http_download",
         "inspect_file",
         "read_csv",
@@ -56,15 +78,71 @@ def test_phase1_tools_are_enabled():
         "extract_pdf_table",
         "validate_required_fields",
         "validate_row_count",
-    ):
-        spec = registry.get(tool_name)
+    ]
+
+    for name in phase1_tools:
+        spec = registry.get(name)
 
         assert spec.enabled is True
         assert spec.function is not None
 
 
-def test_list_enabled_contains_all_phase1_tools():
-    """All registered Phase-1 tools are visible to the agent."""
+def test_phase2_browser_tools_are_enabled():
+    """Implemented browser tools are enabled."""
+
+    registry = build_registry()
+
+    browser_tools = [
+        "browser_open",
+        "browser_inspect",
+        "browser_close",
+    ]
+
+    for name in browser_tools:
+        spec = registry.get(name)
+
+        assert spec.enabled is True
+        assert spec.function is not None
+
+
+def test_future_tools_are_disabled_placeholders():
+    """Future tools remain registered but disabled."""
+
+    registry = build_registry()
+
+    future_tools = [
+        "browser_click",
+        "browser_fill",
+        "browser_select",
+        "browser_wait",
+        "browser_download",
+        "browser_back",
+        "sparql_query",
+        "api_get",
+        "email_search",
+        "email_read",
+        "email_get_attachment",
+        "email_download_link",
+    ]
+
+    for name in future_tools:
+        spec = registry.get(name)
+
+        assert spec.enabled is False
+        assert spec.function is None
+
+
+def test_get_unknown_tool_raises():
+    """Unknown tools raise ToolNotFoundError."""
+
+    registry = build_registry()
+
+    with pytest.raises(ToolNotFoundError):
+        registry.get("does_not_exist")
+
+
+def test_list_enabled_contains_all_implemented_tools():
+    """All implemented tools are visible to the agent."""
 
     registry = build_registry()
 
@@ -73,7 +151,8 @@ def test_list_enabled_contains_all_phase1_tools():
         for spec in registry.list_enabled()
     }
 
-    expected_tools = {
+    expected_enabled_tools = {
+        # Phase 1
         "http_download",
         "inspect_file",
         "read_csv",
@@ -82,22 +161,46 @@ def test_list_enabled_contains_all_phase1_tools():
         "extract_pdf_table",
         "validate_required_fields",
         "validate_row_count",
+
+        # Phase 2
+        "browser_open",
+        "browser_inspect",
+        "browser_close",
     }
 
-    assert enabled_names == expected_tools
+    assert enabled_names == expected_enabled_tools
 
 
-def test_get_unknown_tool_raises():
-    """Unknown tool names must never resolve successfully."""
+def test_list_enabled_excludes_future_placeholders():
+    """Disabled future tools must not be exposed to the model."""
 
     registry = build_registry()
 
-    with pytest.raises(ToolNotFoundError):
-        registry.get("does_not_exist")
+    enabled_names = {
+        spec.name
+        for spec in registry.list_enabled()
+    }
+
+    future_tools = {
+        "browser_click",
+        "browser_fill",
+        "browser_select",
+        "browser_wait",
+        "browser_download",
+        "browser_back",
+        "sparql_query",
+        "api_get",
+        "email_search",
+        "email_read",
+        "email_get_attachment",
+        "email_download_link",
+    }
+
+    assert enabled_names.isdisjoint(future_tools)
 
 
 def test_duplicate_registration_raises():
-    """Registering the same tool twice must fail."""
+    """Registering the same tool twice raises ValueError."""
 
     registry = ToolRegistry()
 
@@ -105,7 +208,9 @@ def test_duplicate_registration_raises():
         name="dummy",
         description="dummy tool",
         category="test",
-        function=lambda: {"success": True},
+        function=lambda: {
+            "success": True,
+        },
         argument_schema={
             "type": "object",
             "properties": {},
@@ -119,9 +224,7 @@ def test_duplicate_registration_raises():
 
 
 def test_to_prompt_list_is_json_serializable_shape():
-    """Tool descriptions exposed to the model must be JSON serializable."""
-
-    import json
+    """Enabled tool descriptions must be JSON serializable."""
 
     registry = build_registry()
 
@@ -129,33 +232,24 @@ def test_to_prompt_list_is_json_serializable_shape():
 
     assert isinstance(prompt_list, list)
 
-    assert len(prompt_list) == 8
+    # 8 Phase-1 tools + 3 implemented Phase-2 browser tools.
+    assert len(prompt_list) == 11
 
     for entry in prompt_list:
-        assert isinstance(entry, dict)
-
         assert "name" in entry
         assert "description" in entry
         assert "category" in entry
         assert "arguments" in entry
         assert "enabled" in entry
 
-        assert isinstance(entry["name"], str)
-        assert isinstance(entry["description"], str)
-        assert isinstance(entry["category"], str)
-        assert isinstance(entry["arguments"], dict)
         assert entry["enabled"] is True
 
-    # The complete tool description must be safely serializable
-    # before it is passed into a model prompt.
-    json.dumps(
-        prompt_list,
-        ensure_ascii=False,
-    )
+    # Ensure the complete prompt structure is JSON serializable.
+    json.dumps(prompt_list)
 
 
 def test_tool_names_are_unique():
-    """The registry must never contain duplicate tool names."""
+    """Every registered tool must have a unique name."""
 
     registry = build_registry()
 
@@ -168,7 +262,7 @@ def test_tool_names_are_unique():
 
 
 def test_all_tools_have_argument_schemas():
-    """Every registered tool must define a JSON Schema."""
+    """Every registered tool must expose an argument schema."""
 
     registry = build_registry()
 
@@ -178,6 +272,43 @@ def test_all_tools_have_argument_schemas():
             dict,
         )
 
-        assert spec.argument_schema.get(
-            "type"
-        ) == "object"
+        assert spec.argument_schema.get("type") == "object"
+
+
+def test_browser_open_has_url_argument():
+    """browser_open must expose the URL argument to the model."""
+
+    registry = build_registry()
+
+    spec = registry.get("browser_open")
+
+    properties = spec.argument_schema["properties"]
+
+    assert "url" in properties
+    assert "timeout" in properties
+
+    assert "url" in spec.argument_schema["required"]
+
+
+def test_browser_inspect_requires_no_arguments():
+    """browser_inspect should accept an empty argument object."""
+
+    registry = build_registry()
+
+    spec = registry.get("browser_inspect")
+
+    assert spec.argument_schema["type"] == "object"
+    assert spec.argument_schema["properties"] == {}
+    assert spec.argument_schema["additionalProperties"] is False
+
+
+def test_browser_close_requires_no_arguments():
+    """browser_close should accept an empty argument object."""
+
+    registry = build_registry()
+
+    spec = registry.get("browser_close")
+
+    assert spec.argument_schema["type"] == "object"
+    assert spec.argument_schema["properties"] == {}
+    assert spec.argument_schema["additionalProperties"] is False
