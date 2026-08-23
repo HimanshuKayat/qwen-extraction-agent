@@ -9,9 +9,10 @@ This module defines:
         Controlled collection of registered tools.
 
     execute_action
-        The single execution gateway used by the agent.
+        Synchronous execution gateway.
 
-The model can only execute tools explicitly registered here.
+    execute_action_async
+        Asynchronous execution gateway.
 
 The registry supports both:
 
@@ -21,7 +22,11 @@ The registry supports both:
     2. Asynchronous tools
        e.g. browser_open, browser_inspect, browser_close
 
-Async tools are executed safely from the synchronous agent interface.
+The synchronous gateway is used by the existing synchronous agent.
+
+The asynchronous gateway is used when the agent is running inside an
+already-active asyncio environment such as Jupyter/Colab, or when the
+agent itself is asynchronous.
 """
 
 from __future__ import annotations
@@ -46,6 +51,11 @@ from core.exceptions import (
 FINISH_ACTION = "finish"
 
 
+# ============================================================================
+# TOOL SPEC
+# ============================================================================
+
+
 @dataclass
 class ToolSpec:
     """Machine-readable description of a single tool."""
@@ -67,6 +77,11 @@ class ToolSpec:
             "arguments": self.argument_schema,
             "enabled": self.enabled,
         }
+
+
+# ============================================================================
+# TOOL REGISTRY
+# ============================================================================
 
 
 class ToolRegistry:
@@ -123,6 +138,11 @@ class ToolRegistry:
         ]
 
 
+# ============================================================================
+# ARGUMENT VALIDATION
+# ============================================================================
+
+
 def validate_arguments(
     spec: ToolSpec,
     arguments: Dict[str, Any],
@@ -157,105 +177,42 @@ def validate_arguments(
         ) from exc
 
 
-def _run_async_result(result: Any) -> Any:
-    """Execute an awaitable from the synchronous agent interface.
+# ============================================================================
+# FINISH ACTION
+# ============================================================================
 
-    The agent currently exposes a synchronous execute_action() API,
-    while browser tools use Playwright's asynchronous API.
 
-    If no event loop is currently running, asyncio.run() is safe.
+def _finish_result(
+    arguments: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Return the standard finish result."""
 
-    If an event loop is already running, we deliberately refuse to
-    execute the coroutine because nesting event loops in the same
-    thread can cause subtle browser/session problems.
-    """
-
-    try:
-        asyncio.get_running_loop()
-
-    except RuntimeError:
-        return asyncio.run(result)
-
-    raise ToolExecutionError(
-        message=(
-            "An asynchronous tool cannot be executed through the "
-            "synchronous agent interface while an event loop is "
-            "already running."
-        ),
-        error_type="AsyncExecutionContextError",
-        recoverable=False,
+    reason = (
+        arguments.get("reason", "")
+        if isinstance(arguments, dict)
+        else ""
     )
 
-
-def _execute_function(
-    function: Callable[..., Any],
-    arguments: Dict[str, Any],
-) -> Any:
-    """Execute either a synchronous or asynchronous tool function."""
-
-    result = function(**arguments)
-
-    if inspect.isawaitable(result):
-        return _run_async_result(result)
-
-    return result
+    return {
+        "success": True,
+        "action": FINISH_ACTION,
+        "reason": reason,
+    }
 
 
-def execute_action(
+# ============================================================================
+# TOOL LOOKUP / VALIDATION
+# ============================================================================
+
+
+def _prepare_tool(
     registry: ToolRegistry,
     action: str,
     arguments: Dict[str, Any],
-) -> Dict[str, Any]:
-    """Validate and execute one model-selected action.
-
-    Execution order:
-
-        1. Handle ``finish``.
-        2. Look up the requested tool.
-        3. Verify that it is enabled.
-        4. Verify that it has an implementation.
-        5. Validate arguments.
-        6. Execute synchronous or asynchronous tool.
-        7. Convert tool failures into structured results.
-
-    The model therefore never gets direct access to:
-
-        eval()
-        exec()
-        shell commands
-        arbitrary Python
-        arbitrary filesystem execution
-
-    Returns:
-        A structured dictionary containing at least ``success``.
-    """
-
-    # ---------------------------------------------------------------
-    # Special finish action
-    # ---------------------------------------------------------------
-
-    if action == FINISH_ACTION:
-        reason = (
-            arguments.get("reason", "")
-            if isinstance(arguments, dict)
-            else ""
-        )
-
-        return {
-            "success": True,
-            "action": FINISH_ACTION,
-            "reason": reason,
-        }
-
-    # ---------------------------------------------------------------
-    # Tool lookup
-    # ---------------------------------------------------------------
+) -> ToolSpec:
+    """Look up and validate a tool before execution."""
 
     spec = registry.get(action)
-
-    # ---------------------------------------------------------------
-    # Enabled check
-    # ---------------------------------------------------------------
 
     if not spec.enabled:
         raise ToolDisabledError(
@@ -265,10 +222,6 @@ def execute_action(
             )
         )
 
-    # ---------------------------------------------------------------
-    # Implementation check
-    # ---------------------------------------------------------------
-
     if spec.function is None:
         raise ToolDisabledError(
             (
@@ -277,61 +230,109 @@ def execute_action(
             )
         )
 
-    # ---------------------------------------------------------------
-    # Argument validation
-    # ---------------------------------------------------------------
-
     validate_arguments(
         spec,
         arguments,
     )
 
-    # ---------------------------------------------------------------
-    # Tool execution
-    # ---------------------------------------------------------------
+    return spec
 
-    start = time.monotonic()
 
+# ============================================================================
+# SYNCHRONOUS TOOL EXECUTION
+# ============================================================================
+
+
+def _execute_sync_function(
+    function: Callable[..., Any],
+    arguments: Dict[str, Any],
+) -> Any:
+    """Execute a tool from the synchronous gateway.
+
+    Synchronous tools execute normally.
+
+    Asynchronous tools are allowed only when no event loop is already
+    running in the current thread. In Jupyter/Colab, callers should use
+    execute_action_async() instead.
+    """
+
+    result = function(**arguments)
+
+    if not inspect.isawaitable(result):
+        return result
+
+    # We have an async tool.
     try:
-        result = _execute_function(
-            spec.function,
-            arguments,
-        )
+        asyncio.get_running_loop()
 
-    except ToolExecutionError as exc:
-        duration = time.monotonic() - start
+    except RuntimeError:
+        # No running event loop. Safe to use asyncio.run().
+        return asyncio.run(result)
 
-        return {
-            "success": False,
-            "error_type": exc.error_type,
-            "message": exc.message,
-            "recoverable": exc.recoverable,
-            "duration_seconds": round(
-                duration,
-                4,
-            ),
-        }
+    # An event loop is already running. We cannot safely nest it.
+    #
+    # IMPORTANT:
+    # Close the coroutine to prevent:
+    #
+    # RuntimeWarning:
+    # coroutine '...' was never awaited
+    #
+    try:
+        result.close()
+    except Exception:
+        pass
 
-    except Exception as exc:
-        # Tool failures must never crash the agent.
-        duration = time.monotonic() - start
+    raise ToolExecutionError(
+        message=(
+            "An asynchronous tool cannot be executed through the "
+            "synchronous agent interface while an event loop is "
+            "already running. Use execute_action_async() instead."
+        ),
+        error_type="AsyncExecutionContextError",
+        recoverable=False,
+    )
 
-        return {
-            "success": False,
-            "error_type": type(exc).__name__,
-            "message": str(exc),
-            "recoverable": True,
-            "duration_seconds": round(
-                duration,
-                4,
-            ),
-        }
 
-    # ---------------------------------------------------------------
-    # Normalize tool result
-    # ---------------------------------------------------------------
+# ============================================================================
+# ASYNC TOOL EXECUTION
+# ============================================================================
 
-    duration = time.monotonic() - start
+
+async def _execute_async_function(
+    function: Callable[..., Any],
+    arguments: Dict[str, Any],
+) -> Any:
+    """Execute either a synchronous or asynchronous tool.
+
+    Synchronous functions execute directly.
+
+    Asynchronous functions are awaited directly in the current event loop.
+    This is the correct execution path for Playwright tools.
+    """
+
+    result = function(**arguments)
+
+    if inspect.isawaitable(result):
+        return await result
+
+    return result
+
+
+# ============================================================================
+# RESULT NORMALIZATION
+# ============================================================================
+
+
+def _normalize_result(
+    result: Any,
+    duration: float,
+) -> Dict[str, Any]:
+    """Normalize a tool result into a structured dictionary."""
+
+    duration_seconds = round(
+        duration,
+        4,
+    )
 
     if isinstance(result, dict):
         result.setdefault(
@@ -339,21 +340,221 @@ def execute_action(
             True,
         )
 
-        result["duration_seconds"] = round(
-            duration,
-            4,
-        )
+        result["duration_seconds"] = duration_seconds
 
         return result
-
-    # Defensive wrapping for tools that accidentally return
-    # something other than a dictionary.
 
     return {
         "success": True,
         "result": result,
+        "duration_seconds": duration_seconds,
+    }
+
+
+def _tool_error_result(
+    exc: ToolExecutionError,
+    duration: float,
+) -> Dict[str, Any]:
+    """Convert ToolExecutionError into a structured result."""
+
+    return {
+        "success": False,
+        "error_type": exc.error_type,
+        "message": exc.message,
+        "recoverable": exc.recoverable,
         "duration_seconds": round(
             duration,
             4,
         ),
     }
+
+
+def _unexpected_error_result(
+    exc: Exception,
+    duration: float,
+) -> Dict[str, Any]:
+    """Convert unexpected exceptions into structured results."""
+
+    return {
+        "success": False,
+        "error_type": type(exc).__name__,
+        "message": str(exc),
+        "recoverable": True,
+        "duration_seconds": round(
+            duration,
+            4,
+        ),
+    }
+
+
+# ============================================================================
+# SYNCHRONOUS EXECUTION GATEWAY
+# ============================================================================
+
+
+def execute_action(
+    registry: ToolRegistry,
+    action: str,
+    arguments: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Validate and execute one model-selected action synchronously.
+
+    This is the existing execution gateway used by the synchronous agent.
+
+    Use this for:
+        - http_download
+        - inspect_file
+        - read_csv
+        - read_excel
+        - read_pdf
+        - validation tools
+        - other synchronous tools
+
+    For asynchronous browser tools inside Jupyter/Colab or an async agent,
+    use execute_action_async().
+
+    Returns:
+        A structured dictionary containing at least ``success``.
+    """
+
+    # ------------------------------------------------------------------
+    # Finish
+    # ------------------------------------------------------------------
+
+    if action == FINISH_ACTION:
+        return _finish_result(arguments)
+
+    # ------------------------------------------------------------------
+    # Prepare tool
+    # ------------------------------------------------------------------
+
+    spec = _prepare_tool(
+        registry,
+        action,
+        arguments,
+    )
+
+    # ------------------------------------------------------------------
+    # Execute
+    # ------------------------------------------------------------------
+
+    start = time.monotonic()
+
+    try:
+        result = _execute_sync_function(
+            spec.function,
+            arguments,
+        )
+
+    except ToolExecutionError as exc:
+        duration = time.monotonic() - start
+
+        return _tool_error_result(
+            exc,
+            duration,
+        )
+
+    except Exception as exc:
+        duration = time.monotonic() - start
+
+        return _unexpected_error_result(
+            exc,
+            duration,
+        )
+
+    # ------------------------------------------------------------------
+    # Normalize
+    # ------------------------------------------------------------------
+
+    duration = time.monotonic() - start
+
+    return _normalize_result(
+        result,
+        duration,
+    )
+
+
+# ============================================================================
+# ASYNCHRONOUS EXECUTION GATEWAY
+# ============================================================================
+
+
+async def execute_action_async(
+    registry: ToolRegistry,
+    action: str,
+    arguments: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Validate and execute one model-selected action asynchronously.
+
+    This is the correct gateway for Playwright browser tools.
+
+    It works inside:
+        - Jupyter
+        - Google Colab
+        - asyncio applications
+        - asynchronous agent loops
+
+    It can execute both synchronous and asynchronous tools.
+
+    Browser session lifecycle is preserved because all browser calls
+    execute inside the same active asyncio environment.
+
+    Returns:
+        A structured dictionary containing at least ``success``.
+    """
+
+    # ------------------------------------------------------------------
+    # Finish
+    # ------------------------------------------------------------------
+
+    if action == FINISH_ACTION:
+        return _finish_result(arguments)
+
+    # ------------------------------------------------------------------
+    # Prepare tool
+    # ------------------------------------------------------------------
+
+    spec = _prepare_tool(
+        registry,
+        action,
+        arguments,
+    )
+
+    # ------------------------------------------------------------------
+    # Execute
+    # ------------------------------------------------------------------
+
+    start = time.monotonic()
+
+    try:
+        result = await _execute_async_function(
+            spec.function,
+            arguments,
+        )
+
+    except ToolExecutionError as exc:
+        duration = time.monotonic() - start
+
+        return _tool_error_result(
+            exc,
+            duration,
+        )
+
+    except Exception as exc:
+        duration = time.monotonic() - start
+
+        return _unexpected_error_result(
+            exc,
+            duration,
+        )
+
+    # ------------------------------------------------------------------
+    # Normalize
+    # ------------------------------------------------------------------
+
+    duration = time.monotonic() - start
+
+    return _normalize_result(
+        result,
+        duration,
+    )
