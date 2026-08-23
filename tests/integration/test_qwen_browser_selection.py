@@ -3,7 +3,7 @@
 The model receives a webpage source and should select browser_open
 as its first action.
 
-This test verifies:
+This verifies:
 
     source configuration
         ↓
@@ -30,7 +30,6 @@ from agent.prompts import build_tool_selection_messages
 from tools.definitions import build_registry
 
 
-@pytest.mark.integration
 def test_qwen_selects_browser_open():
     """Qwen should select browser_open for a webpage source."""
 
@@ -61,9 +60,9 @@ def test_qwen_selects_browser_open():
     user_prompt = messages[1]["content"]
 
     raw_output = model.generate(
-        system_prompt,
-        user_prompt,
         mode="tool_selection",
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
     )
 
     print("\nRAW MODEL RESPONSE:")
