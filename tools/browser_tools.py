@@ -2,8 +2,7 @@
 
 Phase 2 browser foundation.
 
-Uses Playwright's asynchronous API internally while exposing synchronous
-tool functions to the agent registry.
+Uses Playwright's asynchronous API internally.
 
 The browser layer:
 - opens webpages
@@ -18,6 +17,7 @@ It does NOT attempt to bypass or defeat anti-bot protections.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 from urllib.parse import urlparse
 
@@ -33,9 +33,10 @@ from core.exceptions import ToolExecutionError
 
 DEFAULT_TIMEOUT_SECONDS = 30
 
-NETWORK_IDLE_TIMEOUT_MS = 10_000
-RENDER_WAIT_MS = 2_000
-INSPECT_WAIT_MS = 2_000
+# Keep these deliberately short.
+NETWORK_IDLE_TIMEOUT_MS = 5_000
+RENDER_WAIT_MS = 1_000
+INSPECT_WAIT_MS = 500
 
 MAX_TEXT_LENGTH = 20_000
 MAX_HTML_PREVIEW_LENGTH = 50_000
@@ -43,12 +44,12 @@ MAX_LINKS = 200
 
 
 # ============================================================================
-# URL VALIDATION
+# URL NORMALIZATION / VALIDATION
 # ============================================================================
 
 
-def _validate_url(url: str) -> str:
-    """Validate and normalize a browser URL."""
+def _normalize_url(url: str) -> str:
+    """Normalize URLs returned by the model."""
 
     if not isinstance(url, str):
         raise ToolExecutionError(
@@ -59,22 +60,61 @@ def _validate_url(url: str) -> str:
 
     url = url.strip()
 
-    # Qwen sometimes returns a Markdown hyperlink:
+    # ---------------------------------------------------------
+    # Remove surrounding quotes
+    # ---------------------------------------------------------
+
+    if (
+        len(url) >= 2
+        and url[0] == url[-1]
+        and url[0] in {"'", '"'}
+    ):
+        url = url[1:-1].strip()
+
+    # ---------------------------------------------------------
+    # Markdown link:
     #
     # [https://example.com/](https://example.com/)
     #
-    # Convert it to the actual URL.
+    # ---------------------------------------------------------
+
+    markdown_match = re.fullmatch(
+        r"\[([^\]]+)\]\((https?://[^)]+)\)",
+        url,
+        flags=re.IGNORECASE,
+    )
+
+    if markdown_match:
+        url = markdown_match.group(2).strip()
+
+    # ---------------------------------------------------------
+    # Sometimes the model returns:
+    #
+    # <https://example.com/>
+    # ---------------------------------------------------------
+
     if (
-        url.startswith("[")
-        and "](" in url
-        and url.endswith(")")
+        url.startswith("<")
+        and url.endswith(">")
+        and url[1:-1].strip().lower().startswith(
+            ("http://", "https://")
+        )
     ):
-        try:
-            url = url.split("](", 1)[1][:-1]
-        except Exception:
-            pass
+        url = url[1:-1].strip()
+
+    # ---------------------------------------------------------
+    # Remove accidental whitespace
+    # ---------------------------------------------------------
 
     url = url.strip()
+
+    return url
+
+
+def _validate_url(url: str) -> str:
+    """Validate and normalize a browser URL."""
+
+    url = _normalize_url(url)
 
     parsed = urlparse(url)
 
@@ -106,11 +146,12 @@ def _detect_block_type(
     title: str,
     url: str,
 ) -> str | None:
-    """Detect common anti-bot or security challenge pages.
+    """Detect common anti-bot/security challenge pages.
 
-    This function ONLY detects the challenge.
+    Detection only.
 
-    It does not attempt to bypass, solve, or defeat the protection.
+    This function does not attempt to bypass or solve
+    any security mechanism.
     """
 
     combined = "\n".join(
@@ -122,21 +163,24 @@ def _detect_block_type(
         ]
     ).lower()
 
-    # ------------------------------------------------------------------
+    # ---------------------------------------------------------
     # TSPD / NPCI-style protection
-    # ------------------------------------------------------------------
+    # ---------------------------------------------------------
 
-    if (
-        "/tspd/" in combined
-        or "tspd_" in combined
-        or "failureconfig" in combined
-        or "challenge.support_id" in combined
-    ):
-        return "anti_bot_challenge"
+    tspd_indicators = (
+        "/tspd/",
+        "tspd_",
+        "failureconfig",
+        "challenge.support_id",
+    )
 
-    # ------------------------------------------------------------------
+    for indicator in tspd_indicators:
+        if indicator in combined:
+            return "anti_bot_challenge"
+
+    # ---------------------------------------------------------
     # Generic anti-bot indicators
-    # ------------------------------------------------------------------
+    # ---------------------------------------------------------
 
     challenge_indicators = (
         "captcha",
@@ -150,6 +194,10 @@ def _detect_block_type(
         "automated access",
         "are you a robot",
         "human verification",
+        "cloudflare",
+        "perimeterx",
+        "imperva",
+        "incapsula",
     )
 
     for indicator in challenge_indicators:
@@ -207,15 +255,19 @@ class BrowserSession:
                 timeout=timeout * 1000,
             )
 
-            # Give JavaScript-heavy pages time to settle.
+            # ---------------------------------------------------------
+            # Give JavaScript a short opportunity to render.
+            #
+            # Do NOT wait indefinitely for networkidle.
+            # NPCI's challenge page may keep connections alive.
+            # ---------------------------------------------------------
+
             try:
                 await self._page.wait_for_load_state(
                     "networkidle",
                     timeout=NETWORK_IDLE_TIMEOUT_MS,
                 )
             except Exception:
-                # Some pages never reach networkidle because of
-                # analytics, polling, advertisements, etc.
                 pass
 
             await self._page.wait_for_timeout(
@@ -247,7 +299,11 @@ class BrowserSession:
     # ------------------------------------------------------------------
 
     async def inspect(self) -> dict[str, Any]:
-        """Inspect the currently open webpage."""
+        """Inspect the currently open webpage.
+
+        Inspection is deliberately bounded so an anti-bot page,
+        iframe, or JavaScript challenge cannot stall the agent.
+        """
 
         if self._page is None:
             raise ToolExecutionError(
@@ -257,35 +313,34 @@ class BrowserSession:
             )
 
         try:
-            # Give dynamically rendered content another opportunity.
+            # ---------------------------------------------------------
+            # Very short render wait.
+            # ---------------------------------------------------------
+
             await self._page.wait_for_timeout(
                 INSPECT_WAIT_MS
             )
 
-            # ----------------------------------------------------------
-            # Basic page information
-            # ----------------------------------------------------------
+            # ---------------------------------------------------------
+            # Basic information
+            # ---------------------------------------------------------
 
-            title = await self._page.title()
-            url = self._page.url
-
-            # ----------------------------------------------------------
-            # Ensure body exists
-            # ----------------------------------------------------------
+            title = ""
 
             try:
-                await self._page.locator("body").wait_for(
-                    state="attached",
-                    timeout=10_000,
-                )
+                title = await self._page.title()
             except Exception:
                 pass
 
-            body = self._page.locator("body")
+            url = self._page.url
 
-            # ----------------------------------------------------------
-            # Raw HTML
-            # ----------------------------------------------------------
+            # ---------------------------------------------------------
+            # Get complete HTML.
+            #
+            # This is the important part for NPCI because the body
+            # can be effectively empty while the challenge code is
+            # present in the document.
+            # ---------------------------------------------------------
 
             html = ""
 
@@ -294,34 +349,46 @@ class BrowserSession:
             except Exception:
                 pass
 
-            # ----------------------------------------------------------
-            # Visible text
-            # ----------------------------------------------------------
+            # ---------------------------------------------------------
+            # Visible text.
+            #
+            # IMPORTANT:
+            # Do not wait 10 seconds here.
+            # A body already exists on a loaded page.
+            # ---------------------------------------------------------
 
             text = ""
 
             try:
-                text = await body.inner_text(
-                    timeout=10_000,
+                text = await self._page.locator(
+                    "body"
+                ).inner_text(
+                    timeout=2_000,
                 )
             except Exception:
                 pass
 
-            # Fallback to text_content.
+            # ---------------------------------------------------------
+            # Fast fallback to text_content.
+            # ---------------------------------------------------------
+
             if not text.strip():
+
                 try:
                     text = (
-                        await body.text_content(
-                            timeout=5_000,
+                        await self._page.locator(
+                            "body"
+                        ).text_content(
+                            timeout=1_000,
                         )
                         or ""
                     )
                 except Exception:
                     pass
 
-            # ----------------------------------------------------------
+            # ---------------------------------------------------------
             # Links
-            # ----------------------------------------------------------
+            # ---------------------------------------------------------
 
             links: list[dict[str, str]] = []
 
@@ -341,9 +408,22 @@ class BrowserSession:
             except Exception:
                 links = []
 
-            # ----------------------------------------------------------
-            # Detect anti-bot challenge
-            # ----------------------------------------------------------
+            # ---------------------------------------------------------
+            # Iframes
+            # ---------------------------------------------------------
+
+            iframe_count = 0
+
+            try:
+                iframe_count = len(
+                    self._page.frames
+                )
+            except Exception:
+                iframe_count = 0
+
+            # ---------------------------------------------------------
+            # Detect anti-bot challenge BEFORE empty-page detection.
+            # ---------------------------------------------------------
 
             block_type = _detect_block_type(
                 html=html,
@@ -353,6 +433,7 @@ class BrowserSession:
             )
 
             if block_type is not None:
+
                 return {
                     "success": False,
                     "blocked": True,
@@ -363,6 +444,7 @@ class BrowserSession:
                     "text": text[:MAX_TEXT_LENGTH],
                     "links": links[:MAX_LINKS],
                     "link_count": len(links),
+                    "iframe_count": iframe_count,
                     "html_length": len(html),
                     "html_preview": (
                         html[:MAX_HTML_PREVIEW_LENGTH]
@@ -376,11 +458,12 @@ class BrowserSession:
                     ),
                 }
 
-            # ----------------------------------------------------------
-            # Detect completely empty page
-            # ----------------------------------------------------------
+            # ---------------------------------------------------------
+            # Empty/unusable page
+            # ---------------------------------------------------------
 
             if not text.strip() and not links:
+
                 return {
                     "success": False,
                     "blocked": False,
@@ -391,6 +474,7 @@ class BrowserSession:
                     "text": "",
                     "links": [],
                     "link_count": 0,
+                    "iframe_count": iframe_count,
                     "html_length": len(html),
                     "html_preview": (
                         html[:MAX_HTML_PREVIEW_LENGTH]
@@ -402,9 +486,9 @@ class BrowserSession:
                     ),
                 }
 
-            # ----------------------------------------------------------
+            # ---------------------------------------------------------
             # Normal successful inspection
-            # ----------------------------------------------------------
+            # ---------------------------------------------------------
 
             return {
                 "success": True,
@@ -416,6 +500,7 @@ class BrowserSession:
                 "text": text[:MAX_TEXT_LENGTH],
                 "links": links[:MAX_LINKS],
                 "link_count": len(links),
+                "iframe_count": iframe_count,
                 "html_length": len(html),
                 "html_preview": (
                     html[:MAX_HTML_PREVIEW_LENGTH]
@@ -423,6 +508,7 @@ class BrowserSession:
             }
 
         except Exception as exc:
+
             raise ToolExecutionError(
                 message=f"Browser inspection failed: {exc}",
                 error_type="BrowserInspectError",
@@ -446,6 +532,7 @@ class BrowserSession:
             self._page = None
 
             if self._playwright is not None:
+
                 try:
                     await self._playwright.stop()
                 except Exception:
