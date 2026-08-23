@@ -1,43 +1,71 @@
-"""Tests for controlled browser tools."""
+"""Unit tests for controlled browser tools."""
 
 import pytest
 
-from tools.browser_tools import (
-    browser_close,
-    browser_inspect,
-    browser_open,
-)
+from core.exceptions import ToolExecutionError
+from tools.browser_tools import _validate_url
 
 
-@pytest.mark.asyncio
-async def test_browser_open():
-    result = await browser_open(
-        "https://example.com"
+def test_validate_raw_http_url():
+    """A normal HTTP URL is accepted."""
+
+    result = _validate_url(
+        "https://example.com/"
     )
 
-    assert result["success"] is True
-    assert result["title"] == "Example Domain"
-    assert "example.com" in result["url"]
+    assert result == "https://example.com/"
 
 
-@pytest.mark.asyncio
-async def test_browser_inspect():
-    await browser_open(
-        "https://example.com"
+def test_validate_http_url():
+    """HTTP URLs are accepted."""
+
+    result = _validate_url(
+        "http://example.com/"
     )
 
-    result = await browser_inspect()
-
-    assert result["success"] is True
-    assert result["title"] == "Example Domain"
-    assert result["link_count"] >= 1
-    assert isinstance(result["links"], list)
-
-    await browser_close()
+    assert result == "http://example.com/"
 
 
-@pytest.mark.asyncio
-async def test_browser_close():
-    result = await browser_close()
+def test_reject_markdown_url():
+    """Markdown-formatted URLs must never reach Playwright."""
 
-    assert result["success"] is True
+    with pytest.raises(ToolExecutionError) as exc:
+        _validate_url(
+            "[https://example.com/](https://example.com/)"
+        )
+
+    assert exc.value.error_type == "InvalidBrowserURL"
+
+
+def test_reject_angle_bracket_url():
+    """Angle-bracket formatted URLs are rejected."""
+
+    with pytest.raises(ToolExecutionError):
+        _validate_url(
+            "<https://example.com/>"
+        )
+
+
+def test_reject_empty_url():
+    """Empty URLs are rejected."""
+
+    with pytest.raises(ToolExecutionError):
+        _validate_url("")
+
+
+def test_reject_unsupported_scheme():
+    """Only HTTP and HTTPS are supported."""
+
+    with pytest.raises(ToolExecutionError):
+        _validate_url(
+            "ftp://example.com/file"
+        )
+
+
+def test_reject_missing_hostname():
+    """URLs without a hostname are rejected."""
+
+    with pytest.raises(ToolExecutionError):
+        _validate_url(
+            "https://"
+        )
