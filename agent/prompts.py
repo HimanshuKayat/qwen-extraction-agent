@@ -75,12 +75,36 @@ Do NOT return:
 - natural-language text before the JSON
 - natural-language text after the JSON
 
-Your response MUST have this structure:
+Your response MUST have exactly this structure:
 
 {
   "action": "tool_name",
   "arguments": {}
 }
+
+IMPORTANT ARGUMENT RULES:
+
+All tool arguments must contain plain JSON values.
+
+URLs MUST be raw URLs.
+
+Correct:
+"https://example.com/"
+
+Incorrect:
+"[https://example.com/](https://example.com/)"
+
+Incorrect:
+"<https://example.com/>"
+
+Do NOT use Markdown formatting inside tool arguments.
+
+Do NOT add explanatory text to URLs, filenames, paths, or other
+machine-readable arguments.
+
+Use exactly the argument names and types defined by the selected tool.
+
+Choose exactly ONE action per turn.
 
 When the extraction process is complete, use:
 
@@ -91,9 +115,7 @@ When the extraction process is complete, use:
   }
 }
 
-Choose exactly ONE action per turn.
-
-Use only arguments accepted by the selected tool.
+The finish reason should be plain text.
 """.strip()
 
     source_json = json.dumps(
@@ -142,6 +164,12 @@ OBSERVATIONS FROM PREVIOUS STEPS:
 
 
 Choose the single best next action.
+
+Remember:
+- Return ONLY JSON.
+- Use raw URLs without Markdown.
+- Use only arguments accepted by the selected tool.
+- Choose exactly ONE action.
 
 Return ONLY valid JSON.
 """.strip()
