@@ -22,8 +22,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
 from agent.model import QwenModel
 from agent.parser import parse_action
 from agent.prompts import build_tool_selection_messages
@@ -56,13 +54,9 @@ def test_qwen_selects_browser_open():
         observations=[],
     )
 
-    system_prompt = messages[0]["content"]
-    user_prompt = messages[1]["content"]
-
     raw_output = model.generate(
+        messages,
         mode="tool_selection",
-        system_prompt=system_prompt,
-        user_prompt=user_prompt,
     )
 
     print("\nRAW MODEL RESPONSE:")
