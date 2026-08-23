@@ -1,0 +1,16 @@
+source_id: npci_upi_daily
+source_type: webpage
+title: NPCI UPI Daily Statistics
+data_link: https://www.npci.org.in/product/upi/product-statistics
+description: >
+  NPCI official UPI Product Statistics page. Find the Daily Statistics
+  section and identify the downloadable or accessible daily UPI transaction
+  statistics data. Download the relevant raw dataset without manually
+  specifying its final download URL.
+target_schema:
+  frequency: daily
+  subject: UPI transactions
+  fields:
+    - date
+    - transaction_volume
+    - transaction_value
